@@ -1,0 +1,93 @@
+{
+  "_comment_format": "这是标准 JSON，不支持 // 注释；所有以 _comment 开头的字段仅用于说明，脚本会忽略。",
+  "_comment_targetNftIds": "需要监控的对方 Uniswap v4 NFT ID 列表。所有仓位必须与我的仓位使用同一风险代币；稳定币一侧允许使用 stablecoins 白名单中的不同币种，也允许不同费率池。任意一个仓位的流动性比上一次多节点共识结果减少都会触发撤退。",
+  "targetNftIds": [
+    "952067"
+  ],
+  "_comment_myNftId": "我的仓位 NFT ID，PRIVATE_KEY 对应的钱包必须是该 NFT 的持有人。",
+  "myNftId": "952079",
+  "_comment_pollIntervalMs": "每次监控检查完成后等待多久再检查，单位毫秒；实际周期还要加上本轮 RPC 查询耗时。",
+  "pollIntervalMs": 450,
+  "_comment_myPositionCheckIntervalMs": "布防期间独立检查我的 NFT 流动性、持有人和池子的间隔，单位毫秒；发现已外部撤仓或 NFT 转移时自动停止监控，不影响对方仓位的快速检查。",
+  "myPositionCheckIntervalMs": 2000,
+  "_comment_monitorBlockTag": "监控对方仓位使用的区块标签。latest 速度更快，并继续要求多个 HTTP RPC 返回相同仓位结果。",
+  "monitorBlockTag": "latest",
+  "_comment_wssRpcUrl": "WSS 是服务级长连接，用于新区块通知、立即唤醒仓位检查和快速查询交易回执；每轮完成或停止后保持空闲并在下次布防时复用，断开时自动退回 HTTP 轮询。",
+  "wssRpcUrl": "wss://bsc-rpc.publicnode.com",
+  "_comment_withdrawConfirmations": "撤仓交易确认数。1 表示首次入块后立即读取到账数量并准备兑换，不再额外等待下一个区块。",
+  "withdrawConfirmations": 1,
+  "_comment_swapConfirmations": "兑换交易确认数。兑换已首次入块时资产已卖出，脚本继续等待到 2 个确认再完成记录；这段等待不计入关键耗时。",
+  "swapConfirmations": 2,
+  "_comment_approvalConfirmations": "布防阶段无限授权交易的确认数。1 表示授权首次入块后即可开始监控。",
+  "approvalConfirmations": 1,
+  "_comment_swapPreloadMaxAgeMs": "并行取得的 OKX 兑换报价允许复用的最长时间，单位毫秒；过期会重新询价，建议保持 5000。",
+  "swapPreloadMaxAgeMs": 5000,
+  "_comment_receiptPollIntervalMs": "链上交易广播后 HTTP 回执查询的兜底间隔，单位毫秒；WSS 新区块通知会立即唤醒查询，最终仍以链上回执为准。",
+  "receiptPollIntervalMs": 150,
+  "_comment_rpcTimeoutMs": "单个 RPC 操作的超时时间，单位毫秒。",
+  "rpcTimeoutMs": 5000,
+  "_comment_rpcFailureCooldownMs": "RPC 连续失败后暂时移出热路径的冷却时间，单位毫秒。",
+  "rpcFailureCooldownMs": 30000,
+  "_comment_rpcParallelism": "普通 RPC 调用每批并行尝试的节点数量，任意一个成功即可返回。",
+  "rpcParallelism": 4,
+  "_comment_rpcQuorum": "仓位监控至少需要多少个独立 RPC 返回相同结果，建议保持 2 或以上。",
+  "rpcQuorum": 2,
+  "_comment_rpcQuorumSample": "每次共识检查最多同时采样多少个 RPC；当前 4 个节点中任意 2 个返回相同结果即可。",
+  "rpcQuorumSample": 4,
+  "_comment_fallbackFinalityBlocks": "当 RPC 不支持 finalized 区块标签时，改用最新区块减去该数量作为安全区块。",
+  "fallbackFinalityBlocks": 3,
+  "_comment_transactionTimeoutMs": "广播链上交易后等待回执和确认的最长时间，单位毫秒；超时不代表交易一定失败，必须核对链上状态。",
+  "transactionTimeoutMs": 90000,
+  "_comment_okxRequestTimeoutMs": "单次 OKX DEX API 请求超时时间，单位毫秒。",
+  "okxRequestTimeoutMs": 8000,
+  "_comment_okxRequestAttempts": "OKX DEX API 请求失败后的总尝试次数，包括第一次请求。",
+  "okxRequestAttempts": 2,
+  "_comment_maxGasPriceGwei": "允许自动发送交易的最高 GasPrice，单位 Gwei；超过后脚本会拒绝交易。",
+  "maxGasPriceGwei": 5,
+  "_comment_minGasPriceGwei": "自动交易使用的最低 GasPrice，单位 Gwei。RPC 或 OKX 建议值低于该值时提升到该下限；当前 0.1 用于降低低价交易错过区块的概率。",
+  "minGasPriceGwei": 0.1,
+  "_comment_maxGasLimit": "允许自动发送交易的最高 GasLimit，用于拦截异常 Gas 估算。",
+  "maxGasLimit": 3000000,
+  "_comment_maxAllowedSlippageBps": "前端允许设置的最高滑点，单位 BPS；100 BPS=1%，500 BPS=5%。",
+  "maxAllowedSlippageBps": 500,
+  "_comment_maxQuoteValueLossPercent": "根据 OKX 返回的代币价格估算，允许输入与输出价值之间的最大损失百分比。",
+  "maxQuoteValueLossPercent": 5,
+  "_comment_stablecoin": "默认稳定币。当仓位池中的币种未命中 stablecoins 白名单时，撤出后的其他代币默认兑换成这里配置的币种。",
+  "stablecoin": {
+    "symbol": "USDT",
+    "address": "0x55d398326f99059fF775485246999027B3197955"
+  },
+  "_comment_stablecoins": "稳定币白名单。如果建仓池中包含这里的稳定币，撤出后会优先兑换回该池对应的稳定币。",
+  "stablecoins": [
+    {
+      "symbol": "USDT",
+      "address": "0x55d398326f99059fF775485246999027B3197955"
+    },
+    {
+      "symbol": "USD1",
+      "address": "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d"
+    },
+    {
+      "symbol": "USDC",
+      "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+    },
+    {
+      "symbol": "U",
+      "address": "0xce24439f2d9c6a2289f741120fe202248b666666"
+    }
+  ],
+  "_comment_swap": "实际兑换参数。maxSlippageBps 为兑换滑点，100 BPS=1%，当前 500 表示 5%。",
+  "swap": {
+    "maxSlippageBps": 500
+  },
+  "_comment_rpcUrls": "BSC HTTP RPC 节点列表。脚本会并行、共识和故障切换；节点数量不是越多越好，应优先使用低延迟、无频率限制的节点。",
+  "_comment_rpcHealth_20260723": "已移除返回 HTML 的 nodeflare 和频繁限流的 keccak；保留 5 个低延迟节点和 pocket 备用节点。",
+  "rpcUrls": [
+    "https://bsc.rpc.blxrbdn.com",
+    "https://bsc-dataseed.bnbchain.org",
+    "https://bsc-dataseed3.defibit.io",
+    "https://bsc-dataseed4.defibit.io",
+    "https://bsc-dataseed4.bnbchain.org",
+    "https://bsc.api.pocket.network"
+  ]
+}

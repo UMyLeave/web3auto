@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>登录 · Liquidity Guard</title>
+  <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="loginTitle">
+      <header class="login-brand">
+        <span class="brand-mark">OKX</span>
+        <span class="brand-divider"></span>
+        <span>Liquidity Guard</span>
+      </header>
+      <div class="login-copy">
+        <p class="eyebrow">SECURE CONTROL ACCESS</p>
+        <h1 id="loginTitle">管理端登录</h1>
+        <p>登录后才可查看仓位、修改配置或执行链上操作。</p>
+      </div>
+      <form id="loginForm">
+        <label for="username">用户名</label>
+        <input id="username" name="username" autocomplete="username" value="admin" required>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" minlength="12" required autofocus>
+        <button id="loginButton" type="submit">安全登录</button>
+      </form>
+      <p id="loginError" class="login-error" role="alert" aria-live="polite"></p>
+      <footer>
+        <span class="security-dot"></span>
+        会话受 HttpOnly Cookie、限速和 CSRF 校验保护
+      </footer>
+    </section>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>
