@@ -23,8 +23,6 @@ import {
   sameTokenPair,
   singleSwapCandidate,
   sqrtPriceAtTick,
-  startServer,
-  stableValueAtSqrtPrice,
   targetLiquidityDecreases,
   transactionConfirmations,
   validateSwapResponse
@@ -415,18 +413,6 @@ test('uses separate confirmation policies for withdrawal, swap and approval', ()
   assert.equal(transactionConfirmations(config, 'approval'), 1);
 });
 
-test('values either side of a position in the configured pool stablecoin', () => {
-  const sqrtPriceX96 = 2n * (1n << 96n);
-  assert.equal(
-    stableValueAtSqrtPrice(100n, 400n, sqrtPriceX96, 0),
-    200n
-  );
-  assert.equal(
-    stableValueAtSqrtPrice(100n, 400n, sqrtPriceX96, 1),
-    800n
-  );
-});
-
 test('transaction preparation relies on estimateGas without a duplicate eth_call', async () => {
   let estimateCalls = 0;
   const runtime = {
@@ -531,82 +517,4 @@ test('guards raw WebSocket errors before ethers provider listeners are ready', (
   const provider = { websocket: socket };
   guardRawWebSocketErrors(provider);
   assert.doesNotThrow(() => socket.emit('error', new Error('TLS reset')));
-});
-
-test('requires login, session cookie and CSRF token for management APIs', async (t) => {
-  const previousPassword = process.env.ADMIN_PASSWORD;
-  const previousUsername = process.env.ADMIN_USERNAME;
-  process.env.ADMIN_PASSWORD = 'correct-horse-battery-staple';
-  process.env.ADMIN_USERNAME = 'guard-admin';
-  let server;
-  t.after(async () => {
-    if (server) await new Promise((resolve) => server.close(resolve));
-    if (previousPassword === undefined) delete process.env.ADMIN_PASSWORD;
-    else process.env.ADMIN_PASSWORD = previousPassword;
-    if (previousUsername === undefined) delete process.env.ADMIN_USERNAME;
-    else process.env.ADMIN_USERNAME = previousUsername;
-  });
-
-  server = await startServer({ host: '127.0.0.1', port: 0 });
-  const baseUrl = `http://127.0.0.1:${server.address().port}`;
-
-  const denied = await fetch(`${baseUrl}/api/status`);
-  assert.equal(denied.status, 401);
-  assert.equal((await denied.json()).code, 'AUTH_REQUIRED');
-
-  const wrongLogin = await fetch(`${baseUrl}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'guard-admin', password: 'wrong-password' })
-  });
-  assert.equal(wrongLogin.status, 401);
-
-  const login = await fetch(`${baseUrl}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      username: 'guard-admin',
-      password: 'correct-horse-battery-staple'
-    })
-  });
-  assert.equal(login.status, 200);
-  const loginBody = await login.json();
-  const cookie = login.headers.get('set-cookie').split(';')[0];
-  assert.ok(cookie.startsWith('web3auto_session='));
-  assert.ok(loginBody.csrfToken);
-
-  const allowed = await fetch(`${baseUrl}/api/status`, {
-    headers: { cookie }
-  });
-  assert.equal(allowed.status, 200);
-
-  const missingCsrf = await fetch(`${baseUrl}/api/stop`, {
-    method: 'POST',
-    headers: { cookie }
-  });
-  assert.equal(missingCsrf.status, 403);
-  assert.equal((await missingCsrf.json()).code, 'CSRF_INVALID');
-
-  const stopped = await fetch(`${baseUrl}/api/stop`, {
-    method: 'POST',
-    headers: {
-      cookie,
-      'x-csrf-token': loginBody.csrfToken
-    }
-  });
-  assert.equal(stopped.status, 200);
-
-  const logout = await fetch(`${baseUrl}/api/auth/logout`, {
-    method: 'POST',
-    headers: {
-      cookie,
-      'x-csrf-token': loginBody.csrfToken
-    }
-  });
-  assert.equal(logout.status, 200);
-
-  const expired = await fetch(`${baseUrl}/api/status`, {
-    headers: { cookie }
-  });
-  assert.equal(expired.status, 401);
 });

@@ -7,15 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_PATH = path.join(__dirname, 'public');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const ACTION_PATH = path.join(__dirname, '.guard-action.json');
 const ACTION_TMP_PATH = path.join(__dirname, '.guard-action.json.tmp');
-const AUTH_COOKIE = 'web3auto_session';
-const AUTH_SESSION_DEFAULT_MS = 12 * 60 * 60 * 1000;
-const AUTH_SESSION_MAX_MS = 7 * 24 * 60 * 60 * 1000;
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_MAX_FAILURES = 5;
 
 const V4_POSITION_MANAGER = '0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b';
 const POSITION_ABI = [
@@ -70,8 +64,6 @@ let receiptWakeSequence = 0;
 let latestStreamBlock = null;
 const streamBlockObservedAt = new Map();
 const receiptWakeWaiters = new Set();
-const authSessions = new Map();
-const loginFailures = new Map();
 
 function publishStreamBlock(blockNumber) {
   const numericBlock = Number(blockNumber);
@@ -105,190 +97,8 @@ function waitForReceiptWake(sequence, timeoutMs) {
 }
 
 const app = express();
-app.set('trust proxy', 'loopback');
 app.use(express.json({ limit: '32kb' }));
-app.use((_req, res, next) => {
-  res.set({
-    'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'",
-    'Referrer-Policy': 'no-referrer',
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
-  });
-  next();
-});
-
-function authEnabled() {
-  return Boolean(process.env.ADMIN_PASSWORD);
-}
-
-function authUsername() {
-  return String(process.env.ADMIN_USERNAME || 'admin');
-}
-
-function authSessionDurationMs() {
-  const requested = Number(process.env.AUTH_SESSION_HOURS || 12) * 60 * 60 * 1000;
-  return Math.min(
-    AUTH_SESSION_MAX_MS,
-    Math.max(60 * 60 * 1000, Number.isFinite(requested) ? requested : AUTH_SESSION_DEFAULT_MS)
-  );
-}
-
-function parseCookies(header = '') {
-  return Object.fromEntries(String(header).split(';').map((part) => {
-    const separator = part.indexOf('=');
-    if (separator < 0) return null;
-    const name = part.slice(0, separator).trim();
-    if (!name) return null;
-    return [name, decodeURIComponent(part.slice(separator + 1).trim())];
-  }).filter(Boolean));
-}
-
-function constantTimeTextEqual(first, second) {
-  const firstHash = crypto.createHash('sha256').update(String(first)).digest();
-  const secondHash = crypto.createHash('sha256').update(String(second)).digest();
-  return crypto.timingSafeEqual(firstHash, secondHash);
-}
-
-function pruneAuthState(now = Date.now()) {
-  for (const [token, session] of authSessions) {
-    if (session.expiresAt <= now) authSessions.delete(token);
-  }
-  for (const [ip, failure] of loginFailures) {
-    if (now - failure.startedAt >= LOGIN_WINDOW_MS) loginFailures.delete(ip);
-  }
-}
-
-function sessionForRequest(req) {
-  if (!authEnabled()) return { disabled: true, csrfToken: null, expiresAt: Infinity };
-  pruneAuthState();
-  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE];
-  if (!token) return null;
-  const session = authSessions.get(token);
-  if (!session || session.expiresAt <= Date.now()) {
-    if (session) authSessions.delete(token);
-    return null;
-  }
-  return { ...session, token };
-}
-
-function secureAuthCookie(req) {
-  return process.env.AUTH_COOKIE_SECURE === 'true' || req.secure;
-}
-
-function authCookie(token, req, maxAgeSeconds) {
-  const parts = [
-    `${AUTH_COOKIE}=${encodeURIComponent(token)}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Strict',
-    `Max-Age=${maxAgeSeconds}`
-  ];
-  if (secureAuthCookie(req)) parts.push('Secure');
-  return parts.join('; ');
-}
-
-function requirePageAuth(req, res, next) {
-  if (sessionForRequest(req)) return next();
-  res.redirect(303, `/login?next=${encodeURIComponent(req.originalUrl)}`);
-}
-
-function requireApiAuth(req, res, next) {
-  const session = sessionForRequest(req);
-  if (!session) return res.status(401).json({ error: '登录已失效，请重新登录', code: 'AUTH_REQUIRED' });
-  req.authSession = session;
-  return next();
-}
-
-function requireCsrf(req, res, next) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !authEnabled()) return next();
-  const supplied = req.get('x-csrf-token');
-  if (!supplied || !constantTimeTextEqual(supplied, req.authSession.csrfToken)) {
-    return res.status(403).json({ error: '安全令牌无效，请刷新页面后重试', code: 'CSRF_INVALID' });
-  }
-  return next();
-}
-
-function loginFailureState(ip, now = Date.now()) {
-  const current = loginFailures.get(ip);
-  if (!current || now - current.startedAt >= LOGIN_WINDOW_MS) {
-    const fresh = { count: 0, startedAt: now };
-    loginFailures.set(ip, fresh);
-    return fresh;
-  }
-  return current;
-}
-
-app.get('/login', (req, res) => {
-  if (!authEnabled() || sessionForRequest(req)) return res.redirect(303, '/');
-  res.set('Cache-Control', 'no-store');
-  return res.sendFile(path.join(PUBLIC_PATH, 'login.html'));
-});
-
-app.get(['/', '/index.html'], requirePageAuth, (_req, res) => {
-  res.set('Cache-Control', 'no-store');
-  res.sendFile(path.join(PUBLIC_PATH, 'index.html'));
-});
-
-app.get('/api/auth/status', (req, res) => {
-  const session = sessionForRequest(req);
-  res.set('Cache-Control', 'no-store');
-  res.json({
-    enabled: authEnabled(),
-    authenticated: Boolean(session),
-    username: session ? authUsername() : null,
-    csrfToken: session?.csrfToken || null,
-    expiresAt: Number.isFinite(session?.expiresAt) ? new Date(session.expiresAt).toISOString() : null
-  });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  if (!authEnabled()) return res.status(400).json({ error: '服务器尚未启用登录密码' });
-  const now = Date.now();
-  pruneAuthState(now);
-  const failure = loginFailureState(req.ip, now);
-  if (failure.count >= LOGIN_MAX_FAILURES) {
-    const retryAfterMs = Math.max(1000, LOGIN_WINDOW_MS - (now - failure.startedAt));
-    res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
-    return res.status(429).json({ error: `登录失败次数过多，请在 ${Math.ceil(retryAfterMs / 60_000)} 分钟后重试` });
-  }
-  const usernameMatches = constantTimeTextEqual(req.body?.username || '', authUsername());
-  const passwordMatches = constantTimeTextEqual(req.body?.password || '', process.env.ADMIN_PASSWORD);
-  if (!usernameMatches || !passwordMatches) {
-    failure.count += 1;
-    return res.status(401).json({
-      error: '用户名或密码错误',
-      remainingAttempts: Math.max(0, LOGIN_MAX_FAILURES - failure.count)
-    });
-  }
-  loginFailures.delete(req.ip);
-  const token = crypto.randomBytes(32).toString('base64url');
-  const csrfToken = crypto.randomBytes(24).toString('base64url');
-  const durationMs = authSessionDurationMs();
-  const session = {
-    csrfToken,
-    createdAt: now,
-    expiresAt: now + durationMs
-  };
-  authSessions.set(token, session);
-  res.set('Set-Cookie', authCookie(token, req, Math.floor(durationMs / 1000)));
-  return res.json({
-    authenticated: true,
-    username: authUsername(),
-    csrfToken,
-    expiresAt: new Date(session.expiresAt).toISOString()
-  });
-});
-
-app.use('/api', requireApiAuth, requireCsrf);
-
-app.post('/api/auth/logout', (req, res) => {
-  if (req.authSession?.token) authSessions.delete(req.authSession.token);
-  res.set('Set-Cookie', authCookie('', req, 0));
-  res.json({ authenticated: false });
-});
-
-app.use(express.static(PUBLIC_PATH, { index: false }));
+app.use(express.static(path.join(__dirname, 'public')));
 
 async function readConfig() {
   return JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'));
@@ -758,18 +568,6 @@ function principalAmounts(liquidity, sqrtPriceX96, tickLower, tickUpper) {
   };
 }
 
-function stableValueAtSqrtPrice(amount0, amount1, sqrtPriceX96, stableTokenIndex) {
-  if (sqrtPriceX96 <= 0n) throw new Error('池子价格尚未初始化，无法估算仓位价值');
-  const priceX192 = sqrtPriceX96 * sqrtPriceX96;
-  if (stableTokenIndex === 0) {
-    return amount0 + amount1 * (1n << 192n) / priceX192;
-  }
-  if (stableTokenIndex === 1) {
-    return amount1 + amount0 * priceX192 / (1n << 192n);
-  }
-  return null;
-}
-
 const tokenMetadataCache = new Map();
 
 async function tokenMetadata(provider, token, blockTag = 'latest') {
@@ -818,15 +616,7 @@ async function enrichedPosition(provider, position, blockTag, config) {
   const currentTick = signed24(slot0 >> 160n);
   const { tickLower, tickUpper } = positionTicks(position.info);
   const { amount0, amount1 } = principalAmounts(position.liquidity, sqrtPriceX96, tickLower, tickUpper);
-  const stablecoins = configuredStablecoins(config);
-  const stableAddresses = new Set(stablecoins.map((item) => item.address.toLowerCase()));
-  const token0IsStable = stableAddresses.has(token0.address.toLowerCase());
-  const token1IsStable = stableAddresses.has(token1.address.toLowerCase());
-  const stableTokenIndex = token0IsStable ? 0 : token1IsStable ? 1 : null;
-  const stableMetadata = stableTokenIndex === 0 ? token0 : stableTokenIndex === 1 ? token1 : null;
-  const stableValueRaw = stableTokenIndex === null
-    ? null
-    : stableValueAtSqrtPrice(amount0, amount1, sqrtPriceX96, stableTokenIndex);
+  const stableAddresses = new Set(configuredStablecoins(config).map((item) => item.address.toLowerCase()));
   return {
     ...publicPosition(position),
     currentTick,
@@ -834,25 +624,18 @@ async function enrichedPosition(provider, position, blockTag, config) {
     tickUpper,
     amountsEstimated: true,
     amountsExcludeFees: true,
-    estimatedStableValue: stableValueRaw === null ? null : {
-      ...stableMetadata,
-      raw: stableValueRaw.toString(),
-      formatted: ethers.formatUnits(stableValueRaw, stableMetadata.decimals),
-      basis: 'current_pool_price',
-      excludesFees: true
-    },
     amounts: [
       {
         ...token0,
         raw: amount0.toString(),
         formatted: ethers.formatUnits(amount0, token0.decimals),
-        isStablecoin: token0IsStable
+        isStablecoin: stableAddresses.has(token0.address.toLowerCase())
       },
       {
         ...token1,
         raw: amount1.toString(),
         formatted: ethers.formatUnits(amount1, token1.decimals),
-        isStablecoin: token1IsStable
+        isStablecoin: stableAddresses.has(token1.address.toLowerCase())
       }
     ]
   };
@@ -2756,18 +2539,8 @@ export async function startServer(options = {}) {
   await restoreAction();
   const port = Number(options.port ?? process.env.PORT ?? 3000);
   const host = options.host ?? process.env.HOST ?? '127.0.0.1';
-  if (authEnabled() && String(process.env.ADMIN_PASSWORD).length < 12) {
-    throw new Error('ADMIN_PASSWORD 至少需要 12 个字符');
-  }
-  if (!['127.0.0.1', '::1', 'localhost'].includes(String(host).toLowerCase()) && !authEnabled()) {
-    throw new Error('非本机监听必须先配置 ADMIN_PASSWORD，拒绝启动未认证的管理页面');
-  }
   return new Promise((resolve, reject) => {
-    const server = app.listen(port, host, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
+    const server = app.listen(port, host, () => {
       console.log(`BSC v4 liquidity guard: http://${host}:${port}`);
       resolve(server);
     });
@@ -2777,6 +2550,7 @@ export async function startServer(options = {}) {
       cachedPool = null;
       cachedPoolKey = null;
     });
+    server.once('error', reject);
   });
 }
 
@@ -2806,7 +2580,6 @@ export {
   sameTokenPair,
   singleSwapCandidate,
   startBlockStream,
-  stableValueAtSqrtPrice,
   sqrtPriceAtTick,
   targetLiquidityDecreases,
   transactionConfirmations,

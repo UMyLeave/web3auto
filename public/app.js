@@ -20,23 +20,15 @@ let latestPositions = null;
 let refreshFailures = 0;
 let refreshTimer = null;
 let initialLookupScheduled = false;
-let csrfToken = null;
 const toastKeys = new Map();
 
 async function request(url, options = {}) {
-  const { timeoutMs = 15_000, headers = {}, ...fetchOptions } = options;
+  const { timeoutMs = 15_000, ...fetchOptions } = options;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const requestHeaders = {
-      'content-type': 'application/json',
-      ...headers
-    };
-    if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(String(fetchOptions.method || 'GET').toUpperCase())) {
-      requestHeaders['x-csrf-token'] = csrfToken;
-    }
     const response = await fetch(url, {
-      headers: requestHeaders,
+      headers: { 'content-type': 'application/json' },
       signal: controller.signal,
       ...fetchOptions
     });
@@ -47,10 +39,6 @@ async function request(url, options = {}) {
     } catch {
       throw new Error(`接口 ${url} 返回了网页而不是 JSON，请使用 npm start 启动后访问 http://127.0.0.1:3000`);
     }
-    if (response.status === 401 && body.code === 'AUTH_REQUIRED') {
-      window.location.replace(`/login?next=${encodeURIComponent(window.location.pathname)}`);
-      throw new Error('登录已失效，正在跳转');
-    }
     if (!response.ok) throw new Error(body.error || `请求失败（HTTP ${response.status}）`);
     return body;
   } catch (error) {
@@ -59,19 +47,6 @@ async function request(url, options = {}) {
   } finally {
     clearTimeout(timeout);
   }
-}
-
-async function initializeAuth() {
-  const response = await fetch('/api/auth/status', { cache: 'no-store' });
-  if (!response.ok) throw new Error(`认证状态检查失败（HTTP ${response.status}）`);
-  const status = await response.json();
-  if (status.enabled && !status.authenticated) {
-    window.location.replace(`/login?next=${encodeURIComponent(window.location.pathname)}`);
-    return false;
-  }
-  csrfToken = status.csrfToken || null;
-  $('logout').hidden = !status.enabled;
-  return true;
 }
 
 function escapeHtml(value) {
@@ -520,11 +495,7 @@ function renderPosition(label, tokenId, position, kind) {
   const amountRows = amounts.map((amount) =>
     `<div class="asset-amount ${amount.isStablecoin ? 'stable' : ''}"><dt>${amount.isStablecoin ? '稳定币' : '代币'} · ${escapeHtml(amount.symbol)}</dt><dd>${escapeHtml(displayPositionAmount(amount))}</dd></div>`
   ).join('');
-  const stableValue = position.estimatedStableValue;
-  const valueRow = stableValue
-    ? `<div class="asset-value"><dt>仓位估值 · 按当前池价</dt><dd>≈ ${escapeHtml(displayPositionAmount(stableValue))}</dd></div>`
-    : '';
-  return `<article class="position-card ${escapeHtml(kind)}"><div class="position-card-head"><span>${escapeHtml(label)}</span><strong>#${escapeHtml(tokenId)}</strong></div><dl>${valueRow}${amountRows}<div><dt>流动性</dt><dd>${escapeHtml(position.liquidity)}</dd></div><div><dt>持有人</dt><dd title="${escapeHtml(position.owner)}">${escapeHtml(shortAddress(position.owner))}</dd></div><div><dt>价格区间 Tick</dt><dd>${escapeHtml(position.tickLower)} ～ ${escapeHtml(position.tickUpper)}</dd></div><div><dt>费率 / Tick 间距</dt><dd>${escapeHtml(position.poolKey.fee)} / ${escapeHtml(position.poolKey.tickSpacing)}</dd></div></dl></article>`;
+  return `<article class="position-card ${escapeHtml(kind)}"><div class="position-card-head"><span>${escapeHtml(label)}</span><strong>#${escapeHtml(tokenId)}</strong></div><dl>${amountRows}<div><dt>流动性</dt><dd>${escapeHtml(position.liquidity)}</dd></div><div><dt>持有人</dt><dd title="${escapeHtml(position.owner)}">${escapeHtml(shortAddress(position.owner))}</dd></div><div><dt>价格区间 Tick</dt><dd>${escapeHtml(position.tickLower)} ～ ${escapeHtml(position.tickUpper)}</dd></div><div><dt>费率 / Tick 间距</dt><dd>${escapeHtml(position.poolKey.fee)} / ${escapeHtml(position.poolKey.tickSpacing)}</dd></div></dl></article>`;
 }
 
 function aggregateTargetAmounts(targets) {
@@ -545,29 +516,7 @@ function aggregateTargetAmounts(targets) {
   return [...totals.values()];
 }
 
-function aggregateTargetValues(targets) {
-  const totals = new Map();
-  for (const position of targets || []) {
-    const value = position.estimatedStableValue;
-    if (!value?.address) continue;
-    const key = value.address.toLowerCase();
-    const current = totals.get(key) || { ...value, raw: '0' };
-    current.raw = (BigInt(current.raw) + BigInt(value.raw || 0)).toString();
-    current.formatted = formatRaw(current.raw, Number(current.decimals), 6);
-    totals.set(key, current);
-  }
-  return [...totals.values()];
-}
-
 function updateTargetMetric(targets) {
-  const values = aggregateTargetValues(targets);
-  if (values.length) {
-    $('targetPosition').innerHTML = values
-      .map((value) => `<span>≈ ${escapeHtml(displayPositionAmount(value))}</span>`)
-      .join('<span class="metric-separator">·</span>');
-    $('targetPositionDetail').textContent = `${targets.length} 个目标 NFT · 按各池当前价格折算 · 不含未领取手续费`;
-    return;
-  }
   const amounts = aggregateTargetAmounts(targets);
   if (!amounts.length) {
     $('targetPosition').textContent = '-';
@@ -712,15 +661,6 @@ $('stop').onclick = () => runButton($('stop'), '停止中…', async () => {
   await request('/api/stop', { method: 'POST' });
 }, '监控已停止');
 
-$('logout').onclick = async () => {
-  try {
-    await request('/api/auth/logout', { method: 'POST' });
-  } finally {
-    csrfToken = null;
-    window.location.replace('/login');
-  }
-};
-
 $('closeAlert').onclick = () => {
   stopAlarm();
   $('alertDrawer').classList.remove('open');
@@ -732,16 +672,8 @@ if (window.location.protocol === 'file:') {
   $('running').textContent = '未连接服务';
   $('error').textContent = '当前为本地预览：页面样式可正常查看，监控和配置功能请通过 npm start 启动服务后访问。';
 } else {
-  void (async () => {
-    try {
-      if (!await initializeAuth()) return;
-      void pollStatus();
-      setInterval(() => {
-        if (refreshFailures === 0 && !formDirty && !currentStatus?.inFlight) lookupPositions({ silent: true });
-      }, 5000);
-    } catch (error) {
-      $('error').textContent = error.message;
-      notify(error.message, 'error');
-    }
-  })();
+  void pollStatus();
+  setInterval(() => {
+    if (refreshFailures === 0 && !formDirty && !currentStatus?.inFlight) lookupPositions({ silent: true });
+  }, 5000);
 }
