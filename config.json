@@ -2,11 +2,10 @@
   "_comment_format": "这是标准 JSON，不支持 // 注释；所有以 _comment 开头的字段仅用于说明，脚本会忽略。",
   "_comment_targetNftIds": "需要监控的对方 Uniswap v4 NFT ID 列表。所有仓位必须与我的仓位使用同一风险代币；稳定币一侧允许使用 stablecoins 白名单中的不同币种，也允许不同费率池。任意一个仓位的流动性比上一次多节点共识结果减少都会触发撤退。",
   "targetNftIds": [
-    "950743",
-    "950748"
+    "953033"
   ],
   "_comment_myNftId": "我的仓位 NFT ID，PRIVATE_KEY 对应的钱包必须是该 NFT 的持有人。",
-  "myNftId": "950867",
+  "myNftId": "953034",
   "_comment_pollIntervalMs": "每次监控检查完成后等待多久再检查，单位毫秒；实际周期还要加上本轮 RPC 查询耗时。",
   "pollIntervalMs": 450,
   "_comment_myPositionCheckIntervalMs": "布防期间独立检查我的 NFT 流动性、持有人和池子的间隔，单位毫秒；发现已外部撤仓或 NFT 转移时自动停止监控，不影响对方仓位的快速检查。",
