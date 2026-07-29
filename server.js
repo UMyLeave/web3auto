@@ -5,11 +5,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
+import { createLiquidityRouter } from './liquidity-service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const ACTION_PATH = path.join(__dirname, '.guard-action.json');
 const ACTION_TMP_PATH = path.join(__dirname, '.guard-action.json.tmp');
+const LIQUIDITY_CONFIG_PATH = path.join(__dirname, 'liquidity-config.json');
+const LIQUIDITY_ACTION_PATH = path.join(__dirname, '.liquidity-action.json');
 
 const V4_POSITION_MANAGER = '0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b';
 const POSITION_ABI = [
@@ -20,6 +23,7 @@ const POSITION_ABI = [
   'function modifyLiquidities(bytes unlockData,uint256 deadline) payable'
 ];
 const ERC20_ABI = [
+  'event Transfer(address indexed from,address indexed to,uint256 value)',
   'function balanceOf(address) view returns (uint256)',
   'function allowance(address owner,address spender) view returns (uint256)',
   'function approve(address spender,uint256 amount) returns (bool)',
@@ -29,6 +33,7 @@ const ERC20_ABI = [
 const POOL_MANAGER_ABI = ['function extsload(bytes32 slot) view returns (bytes32)'];
 const POSITION_INTERFACE = new ethers.Interface(POSITION_ABI);
 const ERC20_INTERFACE = new ethers.Interface(ERC20_ABI);
+const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
 const ZERO = ethers.ZeroAddress;
 const OKX_NATIVE = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const OKX_API_BASE = 'https://web3.okx.com';
@@ -99,6 +104,26 @@ function waitForReceiptWake(sequence, timeoutMs) {
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+const liquidityRouter = createLiquidityRouter({
+  configPath: LIQUIDITY_CONFIG_PATH,
+  actionPath: LIQUIDITY_ACTION_PATH,
+  executionConflict: () => {
+    if (state.running || state.inFlight || state.arming) {
+      return '仓位监控或撤退/兑换流程正在运行，请先停止并等待链上操作结束';
+    }
+    if (state.lastAction?.stage === 'needs_attention') {
+      return '撤退后的兑换任务仍待处理，请先完成原流程';
+    }
+    return null;
+  }
+});
+app.use('/api/liquidity', liquidityRouter);
+app.get(['/monitor', '/monitor/'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+app.get(['/liquidity', '/liquidity/'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'liquidity.html'));
+});
 
 async function readConfig() {
   return JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'));
@@ -529,7 +554,7 @@ function sqrtPriceAtTick(tick) {
     [0x200n, 0xf987a7253ac413176f2b074cf7815e54n],
     [0x400n, 0xf3392b0822b70005940c7a398e4b70f3n],
     [0x800n, 0xe7159475a2c29b7443b29c7fa6e889d9n],
-    [0x1000n, 0xd097f3bdfd202b8845ad8f792aa5825n],
+    [0x1000n, 0xd097f3bdfd2022b8845ad8f792aa5825n],
     [0x2000n, 0xa9f746462d870fdf8a65dc1f90e061e5n],
     [0x4000n, 0x70d869a156d2a1b890bb3df62baf32f7n],
     [0x8000n, 0x31be135f97d08fd981231505542fcfa6n],
@@ -714,6 +739,52 @@ async function getMineConsensus(runtime) {
   const sampleSize = Math.max(required, Number(runtime.config.rpcQuorumSample) || 5);
   const consensus = await runtime.pool.quorum(
     (provider) => mineSnapshotFromProvider(provider, runtime.config),
+    (snapshot) => [
+      snapshot.mine.liquidityText,
+      snapshot.mine.pool,
+      snapshot.mine.owner.toLowerCase()
+    ].join('|'),
+    required,
+    sampleSize
+  );
+  state.rpc = { voters: consensus.voters, nodes: runtime.pool.diagnostics() };
+  return consensus.value;
+}
+
+async function withdrawPreflightFromProvider(provider, config, tokens, address, request) {
+  const callRequest = {
+    from: address,
+    to: ethers.getAddress(request.to),
+    data: request.data || '0x',
+    value: bigintFrom(request.value)
+  };
+  const [snapshot, before, preparation] = await Promise.all([
+    mineSnapshotFromProvider(provider, config),
+    balanceSnapshotFromProvider(provider, tokens, address, 'latest'),
+    transactionPreparationFromProvider(provider, callRequest).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error })
+    )
+  ]);
+  return {
+    ...snapshot,
+    before,
+    prepared: preparation.value,
+    preparationError: preparation.error?.message || null
+  };
+}
+
+async function getWithdrawPreflightConsensus(runtime, tokens, request) {
+  const required = Math.max(2, Number(runtime.config.rpcQuorum) || 2);
+  const sampleSize = Math.max(required, Number(runtime.config.rpcQuorumSample) || 5);
+  const consensus = await runtime.pool.quorum(
+    (provider) => withdrawPreflightFromProvider(
+      provider,
+      runtime.config,
+      tokens,
+      runtime.wallet.address,
+      request
+    ),
     (snapshot) => [
       snapshot.mine.liquidityText,
       snapshot.mine.pool,
@@ -1198,7 +1269,17 @@ function transactionConfirmations(config, kind = 'swap') {
   return Math.max(1, Number(config.swapConfirmations ?? config.confirmations ?? 2) || 2);
 }
 
-async function prepareTransaction(runtime, request) {
+async function transactionPreparationFromProvider(provider, callRequest) {
+  const [nonce, estimatedGas, feeData] = await Promise.all([
+    provider.getTransactionCount(callRequest.from, 'pending'),
+    provider.estimateGas(callRequest),
+    provider.getFeeData()
+  ]);
+  if (!feeData.gasPrice) throw new Error('RPC 未返回 gasPrice');
+  return { nonce, estimatedGas, gasPrice: feeData.gasPrice };
+}
+
+async function prepareTransaction(runtime, request, preparedHint = null) {
   if (!runtime.wallet) throw new Error('缺少 PRIVATE_KEY');
   const from = runtime.wallet.address;
   const to = ethers.getAddress(request.to);
@@ -1206,16 +1287,29 @@ async function prepareTransaction(runtime, request) {
   const data = request.data || '0x';
   if (!ethers.isHexString(data)) throw new Error('交易 calldata 格式错误');
 
-  const prepared = await runtime.pool.call(async (provider) => {
-    const callRequest = { from, to, data, value };
-    const [nonce, estimatedGas, feeData] = await Promise.all([
-      provider.getTransactionCount(from, 'pending'),
-      provider.estimateGas(callRequest),
-      provider.getFeeData()
-    ]);
-    if (!feeData.gasPrice) throw new Error('RPC 未返回 gasPrice');
-    return { nonce, estimatedGas, gasPrice: feeData.gasPrice };
-  });
+  let prepared = preparedHint;
+  if (!prepared) {
+    const prepareWithProvider = (provider) => transactionPreparationFromProvider(
+      provider,
+      { from, to, data, value }
+    );
+    const preparationAttempts = [runtime.pool.call(prepareWithProvider)];
+    const streamProvider = monitorBlockProvider;
+    if (streamProvider && !streamProvider.destroyed) {
+      preparationAttempts.push(withTimeout(
+        prepareWithProvider(streamProvider),
+        Math.max(1000, Number(runtime.config.rpcTimeoutMs) || 5000),
+        'WSS 交易准备超时'
+      ));
+    }
+    try {
+      prepared = preparationAttempts.length === 1
+        ? await preparationAttempts[0]
+        : await Promise.any(preparationAttempts);
+    } catch (error) {
+      throw error.errors?.at(-1) || error;
+    }
+  }
 
   const minimumGasPrice = ethers.parseUnits(String(runtime.config.minGasPriceGwei ?? 0.1), 'gwei');
   const requestedGasPrice = bigintFrom(request.gasPrice);
@@ -1254,6 +1348,64 @@ async function prepareTransaction(runtime, request) {
     gasPrice,
     signed,
     expectedHash
+  };
+}
+
+async function prepareQuotedTransaction(runtime, request, nonceHint = null) {
+  const suggestedGas = bigintFrom(request.gas);
+  const suggestedGasPrice = bigintFrom(request.gasPrice);
+  if (suggestedGas < 21_000n || suggestedGasPrice <= 0n) {
+    return prepareTransaction(runtime, request);
+  }
+  if (!runtime.wallet) throw new Error('缺少 PRIVATE_KEY');
+  const from = runtime.wallet.address;
+  const to = ethers.getAddress(request.to);
+  const value = bigintFrom(request.value);
+  const data = request.data || '0x';
+  if (!ethers.isHexString(data)) throw new Error('交易 calldata 格式错误');
+  const nonce = nonceHint === null || nonceHint === undefined
+    ? await runtime.pool.call((provider) => provider.getTransactionCount(from, 'pending'))
+    : Number(nonceHint);
+  if (!Number.isSafeInteger(nonce) || nonce < 0) throw new Error('交易 nonce 无效');
+
+  const minimumGasPrice = ethers.parseUnits(String(runtime.config.minGasPriceGwei ?? 0.1), 'gwei');
+  const gasPrice = suggestedGasPrice > minimumGasPrice ? suggestedGasPrice : minimumGasPrice;
+  const maxGasPrice = ethers.parseUnits(String(runtime.config.maxGasPriceGwei ?? 5), 'gwei');
+  if (minimumGasPrice > maxGasPrice) throw new Error('GasPrice 下限不能高于安全上限');
+  if (gasPrice > maxGasPrice) {
+    throw new Error(`当前 gasPrice 超过安全上限 ${runtime.config.maxGasPriceGwei ?? 5} Gwei`);
+  }
+
+  // OKX documents tx.gas as an estimate and recommends increasing it by 50%.
+  // Using that signed quote field avoids another estimateGas round trip after
+  // the time-sensitive route has already been generated.
+  const gasLimit = suggestedGas * 15n / 10n;
+  const maxGasLimit = BigInt(runtime.config.maxGasLimit ?? 3_000_000);
+  if (gasLimit > maxGasLimit) throw new Error(`OKX 建议 Gas ${gasLimit} 超过安全上限 ${maxGasLimit}`);
+
+  const signed = await runtime.wallet.signTransaction({
+    chainId: CHAIN_ID,
+    type: 0,
+    nonce,
+    to,
+    data,
+    value,
+    gasLimit,
+    gasPrice
+  });
+  const expectedHash = ethers.keccak256(signed);
+  return {
+    chainId: CHAIN_ID,
+    from,
+    to,
+    value,
+    data,
+    nonce,
+    gasLimit,
+    gasPrice,
+    signed,
+    expectedHash,
+    preparationSource: 'okx_quote'
   };
 }
 
@@ -1315,6 +1467,39 @@ function singleSwapCandidate(tokens, after, before, stableAddress) {
     .map((token) => ({ token, amount: positiveDelta(after, before, token) }))
     .filter(({ token, amount }) => amount > 0n && token.toLowerCase() !== stable.toLowerCase());
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+function erc20ReceivedAmounts(receipt, tokens, recipient) {
+  if (!receipt?.logs || !Array.isArray(tokens) || tokens.some((token) => ethers.getAddress(token) === ZERO)) {
+    return null;
+  }
+  const recipientTopic = ethers.zeroPadValue(ethers.getAddress(recipient), 32).toLowerCase();
+  const tokenAddresses = new Map(tokens.map((token) => {
+    const address = ethers.getAddress(token);
+    return [address.toLowerCase(), address];
+  }));
+  const amounts = Object.fromEntries([...tokenAddresses.values()].map((token) => [token, 0n]));
+  const matchedTokens = new Set();
+  for (const log of receipt.logs) {
+    const token = tokenAddresses.get(String(log.address || '').toLowerCase());
+    if (!token
+      || String(log.topics?.[0] || '').toLowerCase() !== TRANSFER_TOPIC.toLowerCase()
+      || String(log.topics?.[2] || '').toLowerCase() !== recipientTopic) {
+      continue;
+    }
+    try {
+      const amount = BigInt(log.data);
+      if (amount <= 0n) continue;
+      amounts[token] += amount;
+      matchedTokens.add(token);
+    } catch {
+      return null;
+    }
+  }
+  // A missing event can mean either a legitimate zero amount or a non-standard
+  // token that does not emit Transfer. Require proof for every requested token;
+  // one-sided withdrawals safely use the balance-delta fallback instead.
+  return matchedTokens.size === tokenAddresses.size ? amounts : null;
 }
 
 function preparedSwapMatches(preloaded, tokenIn, amountIn, stableAddress, maxAgeMs = 5000, now = Date.now()) {
@@ -1385,7 +1570,15 @@ async function consumeSwapPreload(handle, runtime, tokenIn, amountIn, stableAddr
   return handle.value;
 }
 
-async function preloadSwapToStable(runtime, tokenIn, amountIn, stableAddress, stableBalanceAtBlock, signal = null) {
+async function preloadSwapToStable(
+  runtime,
+  tokenIn,
+  amountIn,
+  stableAddress,
+  stableBalanceAtBlock,
+  signal = null,
+  nonceHint = null
+) {
   const startedAt = new Date().toISOString();
   const stable = ethers.getAddress(stableAddress);
   const input = tokenIn === ZERO ? OKX_NATIVE : ethers.getAddress(tokenIn);
@@ -1425,7 +1618,7 @@ async function preloadSwapToStable(runtime, tokenIn, amountIn, stableAddress, st
     }
   }
 
-  const [swap, stableBalanceBefore] = await Promise.all([
+  const [swap, stableBalanceBefore, nonce] = await Promise.all([
     okxGet('swap', {
       chainIndex: '56',
       amount: amountIn.toString(),
@@ -1439,17 +1632,21 @@ async function preloadSwapToStable(runtime, tokenIn, amountIn, stableAddress, st
     }, runtime.config, { signal }),
     stableBalanceAtBlock === undefined || stableBalanceAtBlock === null
       ? walletTokenBalance(runtime, stable, address)
-      : Promise.resolve(BigInt(stableBalanceAtBlock))
+      : Promise.resolve(BigInt(stableBalanceAtBlock)),
+    nonceHint === null || nonceHint === undefined
+      ? runtime.pool.call((provider) => provider.getTransactionCount(address, 'pending'))
+      : Promise.resolve(Number(nonceHint))
   ]);
   if (signal?.aborted) throw new Error('兑换预准备已取消');
   const quoteReceivedAt = new Date().toISOString();
   validateSwapResponse(swap, tokenIn, stable, amountIn, address, runtime.config);
-  const preparedTransaction = await prepareTransaction(runtime, {
+  const preparedTransaction = await prepareQuotedTransaction(runtime, {
     to: swap.tx.to,
     data: swap.tx.data,
     value: bigintFrom(swap.tx.value),
+    gas: swap.tx.gas,
     gasPrice: swap.tx.gasPrice
-  });
+  }, nonce);
   if (signal?.aborted) throw new Error('兑换预准备已取消');
   return {
     status: 'ready',
@@ -1562,13 +1759,14 @@ async function swapToStable(runtime, tokenIn, amountIn, stableAddress, action, p
 
   let swap;
   let stableBalanceBefore;
+  let preparedNonce = null;
   if (preloaded) {
     swap = preloaded.swap;
     stableBalanceBefore = BigInt(preloaded.stableBalanceBefore);
   } else {
     action.activeSwap.stage = 'requesting_swap';
     await persistAction(action);
-    [swap, stableBalanceBefore] = await Promise.all([
+    [swap, stableBalanceBefore, preparedNonce] = await Promise.all([
       okxGet('swap', {
         chainIndex: '56',
         amount: amountIn.toString(),
@@ -1580,7 +1778,8 @@ async function swapToStable(runtime, tokenIn, amountIn, stableAddress, action, p
         swapReceiverAddress: address,
         gasLevel: 'fast'
       }, runtime.config),
-      walletTokenBalance(runtime, stable, address)
+      walletTokenBalance(runtime, stable, address),
+      runtime.pool.call((provider) => provider.getTransactionCount(address, 'pending'))
     ]);
   }
   validateSwapResponse(swap, tokenIn, stable, amountIn, address, runtime.config);
@@ -1597,18 +1796,23 @@ async function swapToStable(runtime, tokenIn, amountIn, stableAddress, action, p
   };
   const swapTransaction = preloaded
     ? await submitPreparedTransaction(runtime, preloaded.preparedTransaction, onBroadcast, onIncluded)
-    : await sendTransaction(runtime, {
+    : await submitPreparedTransaction(runtime, await prepareQuotedTransaction(runtime, {
       to: swap.tx.to,
       data: swap.tx.data,
       value: bigintFrom(swap.tx.value),
+      gas: swap.tx.gas,
       gasPrice: swap.tx.gasPrice
-    }, onBroadcast, onIncluded);
+    }, preparedNonce), onBroadcast, onIncluded);
   const receipt = swapTransaction.receipt;
   action.activeSwap.swapIncludedAt = swapTransaction.includedAt;
   action.activeSwap.swapConfirmedAt = swapTransaction.confirmedAt;
   action.activeSwap.swapConfirmationWaitMs = swapTransaction.confirmationWaitMs;
   const verificationStartedAt = new Date().toISOString();
-  const stableBalanceAfter = await walletTokenBalance(runtime, stable, address, receipt.blockNumber);
+  const receiptStableAmounts = erc20ReceivedAmounts(receipt, [stable], address);
+  const receiptStableReceived = receiptStableAmounts?.[stable] ?? null;
+  const stableBalanceAfter = receiptStableReceived === null
+    ? await walletTokenBalance(runtime, stable, address, receipt.blockNumber)
+    : null;
   const completedAt = new Date().toISOString();
   const verificationDurationMs = elapsedMs(verificationStartedAt, completedAt);
   const criticalDurationMs = Math.max(
@@ -1624,11 +1828,14 @@ async function swapToStable(runtime, tokenIn, amountIn, stableAddress, action, p
     toTokenSymbol: stableMeta?.symbol,
     toTokenDecimals: stableMeta?.decimals,
     quotedReceived: swap.routerResult.toTokenAmount,
-    actualReceived: positiveDelta(
-      { [stable]: stableBalanceAfter },
-      { [stable]: stableBalanceBefore },
-      stable
-    ).toString(),
+    actualReceived: receiptStableReceived === null
+      ? positiveDelta(
+        { [stable]: stableBalanceAfter },
+        { [stable]: stableBalanceBefore },
+        stable
+      ).toString()
+      : receiptStableReceived.toString(),
+    actualReceivedSource: receiptStableReceived === null ? 'balance_delta' : 'receipt_transfer_logs',
     txHash: receipt.hash,
     router: swap.tx.to,
     approvalTxHash: action.activeSwap.approvalTxHash,
@@ -1707,13 +1914,34 @@ async function executeWithdraw(runtime, trigger = null) {
   await persistAction(action);
 
   try {
-    const baselineTokens = Array.isArray(state.baseline?.tokens) ? state.baseline.tokens : null;
-    const [snapshot, baselineBefore] = await Promise.all([
-      getMineConsensus(runtime),
-      baselineTokens
-        ? balanceSnapshot(runtime, baselineTokens, runtime.wallet.address)
-        : Promise.resolve(null)
-    ]);
+    const baseline = state.baseline;
+    const baselineTokens = Array.isArray(baseline?.tokens) ? baseline.tokens : null;
+    const deadline = Math.floor(Date.now() / 1000) + 120;
+    let baselineRequest = null;
+    if (baseline?.poolKey && baseline?.liquidity) {
+      const baselineUnlockData = await encodeWithdraw(
+        runtime.config.myNftId,
+        BigInt(baseline.liquidity),
+        baseline.poolKey,
+        runtime.wallet.address
+      );
+      baselineRequest = {
+        to: V4_POSITION_MANAGER,
+        data: POSITION_INTERFACE.encodeFunctionData('modifyLiquidities', [baselineUnlockData, deadline]),
+        value: 0n
+      };
+    }
+    // Each quorum voter performs the safety snapshot, pre-withdraw balances and
+    // transaction estimation together. This preserves two-node agreement while
+    // avoiding competing calls that could exhaust the shared RPC pool.
+    const preflight = baselineTokens && baselineRequest
+      ? await getWithdrawPreflightConsensus(runtime, baselineTokens, baselineRequest)
+      : null;
+    const snapshot = preflight || await getMineConsensus(runtime);
+    const baselineBefore = preflight?.before
+      || (baselineTokens
+        ? await fastIncludedBalanceSnapshot(runtime, baselineTokens, runtime.wallet.address, 'latest')
+        : null);
     const mineIssue = minePositionIssue(snapshot, state.baseline, runtime.wallet.address);
     if (mineIssue) throw minePositionInactiveError(mineIssue);
 
@@ -1734,27 +1962,38 @@ async function executeWithdraw(runtime, trigger = null) {
         [...new Set([...tokens, poolStablecoin])]
           .map((token) => tokenMetadata(provider, token, snapshot.block))
       ));
+    const preparedBaselineStillExact = Boolean(preflight?.prepared
+      && baselineRequest
+      && snapshot.mine.pool === baseline?.pool
+      && snapshot.mine.liquidityText === String(baseline?.liquidity));
+    let preparedWithdraw;
+    if (preparedBaselineStillExact) {
+      preparedWithdraw = await prepareTransaction(runtime, baselineRequest, preflight.prepared);
+    } else {
+      const unlockData = await encodeWithdraw(
+        runtime.config.myNftId,
+        snapshot.mine.liquidity,
+        snapshot.mine.poolKey,
+        runtime.wallet.address
+      );
+      preparedWithdraw = await prepareTransaction(runtime, {
+        to: V4_POSITION_MANAGER,
+        data: POSITION_INTERFACE.encodeFunctionData('modifyLiquidities', [unlockData, deadline]),
+        value: 0n
+      });
+    }
     action.stage = 'withdrawing';
     action.tokens = tokens;
     action.poolStablecoin = poolStablecoin;
+    action.withdrawPreparationMode = preparedBaselineStillExact ? 'quorum_parallel' : 'refreshed_snapshot';
     action.tokenMetadata = Object.fromEntries(metadata.map((item) => [item.address.toLowerCase(), item]));
     action.beforeBalances = Object.fromEntries(Object.entries(before).map(([key, value]) => [key, value.toString()]));
     await persistAction(action);
 
-    const unlockData = await encodeWithdraw(
-      runtime.config.myNftId,
-      snapshot.mine.liquidity,
-      snapshot.mine.poolKey,
-      runtime.wallet.address
-    );
-    const deadline = Math.floor(Date.now() / 1000) + 120;
     let afterBalancesPromise = null;
     let swapPreloadHandle = null;
-    const withdrawTransaction = await sendTransaction(runtime, {
-      to: V4_POSITION_MANAGER,
-      data: POSITION_INTERFACE.encodeFunctionData('modifyLiquidities', [unlockData, deadline]),
-      value: 0n
-    }, async (hash) => {
+    let receiptWithdrawAmounts = null;
+    const withdrawTransaction = await submitPreparedTransaction(runtime, preparedWithdraw, async (hash) => {
       action.withdrawTxHash = hash;
       action.currentTx = { type: 'withdraw', hash };
       action.stage = 'withdraw_submitted';
@@ -1763,6 +2002,38 @@ async function executeWithdraw(runtime, trigger = null) {
     }, (includedReceipt, includedAt) => {
       action.withdrawIncludedAt = includedAt;
       action.withdrawBlock = includedReceipt.blockNumber;
+      receiptWithdrawAmounts = erc20ReceivedAmounts(
+        includedReceipt,
+        tokens,
+        runtime.wallet.address
+      );
+      if (receiptWithdrawAmounts) {
+        action.withdrawAmountSource = 'receipt_transfer_logs';
+        action.withdrawAmounts = Object.fromEntries(
+          Object.entries(receiptWithdrawAmounts).map(([token, amount]) => [token, amount.toString()])
+        );
+        const zeroBalances = Object.fromEntries(tokens.map((token) => [token, 0n]));
+        const candidate = singleSwapCandidate(
+          tokens,
+          receiptWithdrawAmounts,
+          zeroBalances,
+          poolStablecoin
+        );
+        if (candidate) {
+          const stableBalanceAfterWithdraw = (before[poolStablecoin] ?? 0n)
+            + (receiptWithdrawAmounts[poolStablecoin] ?? 0n);
+          swapPreloadHandle = trackSwapPreload(preloadSwapToStable(
+            runtime,
+            candidate.token,
+            candidate.amount,
+            poolStablecoin,
+            stableBalanceAfterWithdraw,
+            null,
+            preparedWithdraw.nonce + 1
+          ));
+        }
+        return;
+      }
       afterBalancesPromise = fastIncludedBalanceSnapshot(
         runtime,
         tokens,
@@ -1781,7 +2052,9 @@ async function executeWithdraw(runtime, trigger = null) {
           candidate.token,
           candidate.amount,
           poolStablecoin,
-          afterResult.value[poolStablecoin]
+          afterResult.value[poolStablecoin],
+          null,
+          preparedWithdraw.nonce + 1
         );
       }));
     }, 'withdraw');
@@ -1801,17 +2074,28 @@ async function executeWithdraw(runtime, trigger = null) {
     action.stage = 'withdraw_confirmed';
     await persistAction(action);
 
-    const afterResult = afterBalancesPromise
-      ? await afterBalancesPromise
-      : { value: await balanceSnapshot(runtime, tokens, runtime.wallet.address, receipt.blockNumber) };
-    if (afterResult.error) throw afterResult.error;
-    const after = afterResult.value;
-    action.afterBalances = Object.fromEntries(Object.entries(after).map(([key, value]) => [key, value.toString()]));
+    let withdrawnAmounts = receiptWithdrawAmounts;
+    if (!withdrawnAmounts) {
+      const afterResult = afterBalancesPromise
+        ? await afterBalancesPromise
+        : { value: await balanceSnapshot(runtime, tokens, runtime.wallet.address, receipt.blockNumber) };
+      if (afterResult.error) throw afterResult.error;
+      const after = afterResult.value;
+      action.afterBalances = Object.fromEntries(Object.entries(after).map(([key, value]) => [key, value.toString()]));
+      action.withdrawAmountSource = 'balance_delta';
+      withdrawnAmounts = Object.fromEntries(tokens.map((token) => [
+        token,
+        positiveDelta(after, before, token)
+      ]));
+      action.withdrawAmounts = Object.fromEntries(
+        Object.entries(withdrawnAmounts).map(([token, amount]) => [token, amount.toString()])
+      );
+    }
     action.stage = 'swapping';
     await persistAction(action);
 
     for (const token of tokens) {
-      const amount = positiveDelta(after, before, token);
+      const amount = withdrawnAmounts[token] ?? 0n;
       const meta = actionTokenMeta(action, token);
       if (amount <= 0n) {
         action.results.push({
@@ -1918,19 +2202,34 @@ async function walletTokenBalance(runtime, token, address, blockTag = 'latest') 
 }
 
 async function hydratePendingResults(runtime, action) {
-  if (!Array.isArray(action.tokens) || !action.beforeBalances) {
-    throw new Error('执行记录缺少 token 或撤出前余额，无法自动恢复');
+  if (!Array.isArray(action.tokens)) {
+    throw new Error('执行记录缺少 token，无法自动恢复');
   }
-  if (!action.afterBalances) {
+  if (!action.withdrawAmounts && action.withdrawTxHash) {
+    const receipt = await runtime.pool.firstReceipt(action.withdrawTxHash);
+    const received = erc20ReceivedAmounts(receipt, action.tokens, runtime.wallet.address);
+    if (received) {
+      action.withdrawAmountSource = 'receipt_transfer_logs_recovered';
+      action.withdrawAmounts = Object.fromEntries(
+        Object.entries(received).map(([token, amount]) => [token, amount.toString()])
+      );
+    }
+  }
+  if (!action.withdrawAmounts && !action.beforeBalances) {
+    throw new Error('执行记录缺少撤出金额和撤出前余额，无法自动恢复');
+  }
+  if (!action.withdrawAmounts && !action.afterBalances) {
     const current = await balanceSnapshot(runtime, action.tokens, runtime.wallet.address);
     action.afterBalances = Object.fromEntries(Object.entries(current).map(([key, value]) => [key, value.toString()]));
   }
   const knownTokens = new Set(action.results.map((item) => item.tokenIn.toLowerCase()));
   for (const token of action.tokens) {
     if (knownTokens.has(token.toLowerCase())) continue;
-    const amount = BigInt(action.afterBalances[token] ?? 0) - BigInt(action.beforeBalances[token] ?? 0);
+    const amount = action.withdrawAmounts
+      ? BigInt(action.withdrawAmounts[token] ?? 0)
+      : BigInt(action.afterBalances[token] ?? 0) - BigInt(action.beforeBalances[token] ?? 0);
     action.results.push(amount > 0n
-      ? { tokenIn: token, amountIn: amount.toString(), status: 'failed', error: '从余额快照恢复的待兑换任务' }
+      ? { tokenIn: token, amountIn: amount.toString(), status: 'failed', error: '从撤出记录恢复的待兑换任务' }
       : { tokenIn: token, amountIn: amount.toString(), status: 'skipped', reason: '未检测到正余额增量' });
   }
   if (!action.tokenMetadata) {
@@ -2410,19 +2709,24 @@ app.post('/api/positions', async (req, res) => {
 });
 
 app.post('/api/start', async (_req, res) => {
+  let operationLockAcquired = false;
   try {
     if (process.env.AUTO_EXECUTE !== 'true') throw new Error('AUTO_EXECUTE=false。请在 .env 中明确开启自动交易。');
+    if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
     if (state.inFlight) throw new Error('已有链上操作正在执行');
     if (state.lastAction?.stage === 'needs_attention') throw new Error('存在待处理的撤出后兑换任务，请先重试兑换或手工处理');
     if (!state.running) {
-      const runtime = await loadRuntime();
       state.inFlight = true;
       state.arming = true;
+      operationLockAcquired = true;
+      let runtime;
       try {
+        runtime = await loadRuntime();
         await armGuard(runtime);
       } finally {
         state.arming = false;
         state.inFlight = false;
+        operationLockAcquired = false;
       }
       state.running = true;
       state.error = null;
@@ -2438,6 +2742,11 @@ app.post('/api/start', async (_req, res) => {
     state.armed = false;
     state.error = error.message;
     res.status(400).json({ error: error.message });
+  } finally {
+    if (operationLockAcquired) {
+      state.arming = false;
+      state.inFlight = false;
+    }
   }
 });
 
@@ -2461,20 +2770,27 @@ app.post('/api/check', async (_req, res) => {
 });
 
 app.post('/api/retry-swaps', async (_req, res) => {
+  let operationLockAcquired = false;
   try {
     if (state.running) throw new Error('请先停止监控再重试兑换');
+    if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
     if (state.inFlight) throw new Error('已有链上操作正在执行');
+    state.inFlight = true;
+    operationLockAcquired = true;
     const runtime = await loadRuntime();
     const action = await retryPendingSwaps(runtime);
     res.json(action);
   } catch (error) {
     state.error = error.message;
     res.status(400).json({ error: error.message });
+  } finally {
+    if (operationLockAcquired) state.inFlight = false;
   }
 });
 
 app.post('/api/resolve-manual', async (_req, res) => {
   try {
+    if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
     if (state.running || state.inFlight) throw new Error('请先停止监控，且等待当前链上操作结束');
     const action = state.lastAction;
     if (!action || action.stage !== 'needs_attention' || !action.withdrawTxHash) {
@@ -2565,6 +2881,7 @@ export {
   consumeSwapPreload,
   app,
   describeNetworkError,
+  erc20ReceivedAmounts,
   encodeUnlimitedApproval,
   guardRawWebSocketErrors,
   idleBlockStream,
@@ -2572,6 +2889,7 @@ export {
   normalizeTargetNftIds,
   poolFingerprint,
   positionTicks,
+  prepareQuotedTransaction,
   prepareTransaction,
   preparedSwapMatches,
   principalAmounts,

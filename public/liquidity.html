@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BSC v4 初始化流动性</title>
+  <link rel="stylesheet" href="/liquidity.css">
+  <link rel="stylesheet" href="/modules/sidebar.css">
+</head>
+<body data-page="liquidity">
+  <div id="liquidityToast" class="liquidity-toast" role="status" aria-live="polite"></div>
+
+  <main class="liquidity-shell">
+    <header class="liquidity-pagebar">
+      <div class="liquidity-heading">
+        <span class="liquidity-heading-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/></svg>
+        </span>
+        <div>
+          <h1>初始化流动性</h1>
+          <p>创建新的 Uniswap v4 池并添加初始流动性</p>
+        </div>
+      </div>
+      <div id="walletState" class="wallet-state">读取执行环境</div>
+    </header>
+
+    <section class="wallet-balance-panel" aria-label="执行钱包余额">
+      <div class="wallet-balance-heading">
+        <div>
+          <span>执行钱包</span>
+          <strong id="walletAddress">正在读取…</strong>
+        </div>
+        <small id="balanceUpdated">余额每 5 秒刷新</small>
+      </div>
+      <div id="walletBalances" class="wallet-balance-list">
+        <span class="balance-placeholder">正在查询 BSC 余额…</span>
+      </div>
+    </section>
+
+    <div class="liquidity-layout">
+      <form id="liquidityForm" class="liquidity-card liquidity-form-card">
+        <section class="form-section">
+          <div class="section-label">
+            <span>交易对</span>
+            <small>当前版本仅支持 ERC20 / ERC20</small>
+          </div>
+
+          <label class="liquidity-field" for="tradeToken">
+            <span>交易代币合约</span>
+            <input id="tradeToken" name="tradeToken" spellcheck="false" autocomplete="off"
+              placeholder="0x…">
+          </label>
+
+          <div class="quote-grid">
+            <label class="liquidity-field" for="quoteToken">
+              <span>计价代币</span>
+              <select id="quoteToken" name="quoteToken"></select>
+            </label>
+            <label class="liquidity-field" for="quoteAddress">
+              <span>计价代币合约</span>
+              <input id="quoteAddress" readonly aria-readonly="true">
+            </label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <div class="section-label">
+            <span>价格与池参数</span>
+            <small>精确 PoolKey 已存在时会在预检阶段停止</small>
+          </div>
+
+          <label class="liquidity-field" for="price">
+            <span>代币价格</span>
+            <input id="price" name="price" type="number" min="0" step="any" inputmode="decimal"
+              placeholder="1">
+            <small id="priceHint">1 交易代币 = — 稳定币</small>
+          </label>
+
+          <div class="two-column">
+            <label class="liquidity-field" for="feePercent">
+              <span>V4 费率 %</span>
+              <input id="feePercent" name="feePercent" type="number" min="0" step="0.01"
+                inputmode="decimal" value="0.3">
+            </label>
+            <label class="liquidity-field" for="tickSpacing">
+              <span>Tick Spacing</span>
+              <input id="tickSpacing" name="tickSpacing" type="number" min="1" max="32767"
+                inputmode="numeric" value="60">
+            </label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <div class="section-label">
+            <span>投入稳定币</span>
+            <small>系统自动兑换所需部分，并按仓位区间分配</small>
+          </div>
+          <div class="choice-grid budget-choices" role="group" aria-label="投入稳定币">
+            <button type="button" class="choice active" data-budget="10">10U</button>
+            <button type="button" class="choice" data-budget="20">20U</button>
+            <button type="button" class="choice" data-budget="50">50U</button>
+            <button type="button" class="choice" data-budget="custom">自定义</button>
+          </div>
+          <label id="customBudgetField" class="liquidity-field conditional-field" for="customBudget">
+            <span>自定义稳定币投入</span>
+            <div class="field-with-unit">
+              <input id="customBudget" type="number" min="0" step="any" inputmode="decimal">
+              <span id="budgetUnit">U</span>
+            </div>
+          </label>
+        </section>
+
+        <section class="form-section">
+          <div class="section-label">
+            <span>流动性区间</span>
+            <small>百分比区间以新池初始价为中心</small>
+          </div>
+          <div class="choice-grid range-choices" role="group" aria-label="流动性区间">
+            <button type="button" class="choice active" data-range="percent" data-percent="90">±90%</button>
+            <button type="button" class="choice" data-range="percent" data-percent="50">±50%</button>
+            <button type="button" class="choice" data-range="full">全区间</button>
+            <button type="button" class="choice" data-range="custom">自定义</button>
+          </div>
+          <div id="customRangeFields" class="two-column conditional-field">
+            <label class="liquidity-field" for="lowerPrice">
+              <span>最低价格</span>
+              <input id="lowerPrice" type="number" min="0" step="any" inputmode="decimal">
+            </label>
+            <label class="liquidity-field" for="upperPrice">
+              <span>最高价格</span>
+              <input id="upperPrice" type="number" min="0" step="any" inputmode="decimal">
+            </label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <div class="section-label">
+            <span>Hooks</span>
+            <small>默认无需设置；自定义 Hooks 会执行外部合约逻辑</small>
+          </div>
+          <label class="liquidity-field" for="hooks">
+            <span>Hooks 合约地址</span>
+            <input id="hooks" name="hooks" spellcheck="false" autocomplete="off"
+              value="0x0000000000000000000000000000000000000000">
+          </label>
+          <label id="hooksAcknowledge" class="risk-confirm conditional-field">
+            <input id="acknowledgeCustomHooks" type="checkbox">
+            <span>我已核对自定义 Hooks 合约及其权限，并确认承担外部合约执行风险</span>
+          </label>
+        </section>
+
+        <div class="form-actions">
+          <button id="previewButton" class="secondary-button" type="submit">只读预检</button>
+          <button id="executeButton" class="primary-button" type="button" disabled>确认并执行加池</button>
+        </div>
+        <p id="formMessage" class="form-message" aria-live="polite"></p>
+      </form>
+
+      <aside class="liquidity-summary-column">
+        <section class="liquidity-card summary-card">
+          <div class="summary-heading">
+            <div>
+              <span>执行预览</span>
+              <small>不会在预检阶段广播交易</small>
+            </div>
+            <span id="previewState" class="summary-badge">待预检</span>
+          </div>
+          <div id="previewResult" class="summary-empty">
+            填写参数后进行只读预检，这里会显示池状态、稳定币自动分配、区间和授权需求。
+          </div>
+          <div id="actionControls" class="action-controls" hidden>
+            <button id="resolveActionButton" class="danger-button" type="button">
+              结束本次任务
+            </button>
+          </div>
+        </section>
+
+        <section class="liquidity-card safety-card">
+          <strong>执行边界</strong>
+          <ul>
+            <li>使用独立流动性配置和执行记录</li>
+            <li>与仓位监控、撤退及兑换任务互斥</li>
+            <li>先确认新池初始化成功，再兑换代币和创建仓位</li>
+            <li>私钥仅由服务端从 .env 读取，前端只接收公开地址和余额</li>
+          </ul>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <script type="module" src="/modules/sidebar.js"></script>
+  <script type="module" src="/liquidity.js"></script>
+</body>
+</html>

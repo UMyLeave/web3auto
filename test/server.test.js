@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { ethers } from 'ethers';
 import {
   blockStreamCanBeReused,
   cachedApprovalForAmount,
@@ -9,12 +10,14 @@ import {
   completeActionMetrics,
   consumeSwapPreload,
   describeNetworkError,
+  erc20ReceivedAmounts,
   encodeUnlimitedApproval,
   guardRawWebSocketErrors,
   minePositionIssue,
   normalizeTargetNftIds,
   poolFingerprint,
   positionTicks,
+  prepareQuotedTransaction,
   prepareTransaction,
   preparedSwapMatches,
   principalAmounts,
@@ -334,6 +337,55 @@ test('preloads only when exactly one non-stable token needs a swap', () => {
   );
 });
 
+test('derives exact withdrawn ERC-20 amounts from receipt transfer logs', () => {
+  const transferTopic = ethers.id('Transfer(address,address,uint256)');
+  const recipientTopic = ethers.zeroPadValue(WALLET, 32);
+  const senderTopic = ethers.zeroPadValue(ROUTER, 32);
+  const received = erc20ReceivedAmounts({
+    logs: [
+      {
+        address: TOKEN_IN,
+        topics: [transferTopic, senderTopic, recipientTopic],
+        data: ethers.zeroPadValue(ethers.toBeHex(123n), 32)
+      },
+      {
+        address: TOKEN_IN,
+        topics: [transferTopic, senderTopic, recipientTopic],
+        data: ethers.zeroPadValue(ethers.toBeHex(7n), 32)
+      },
+      {
+        address: TOKEN_OUT,
+        topics: [transferTopic, senderTopic, recipientTopic],
+        data: ethers.zeroPadValue(ethers.toBeHex(50n), 32)
+      }
+    ]
+  }, [TOKEN_IN, TOKEN_OUT], WALLET);
+
+  assert.deepEqual(received, {
+    [ethers.getAddress(TOKEN_IN)]: 130n,
+    [ethers.getAddress(TOKEN_OUT)]: 50n
+  });
+});
+
+test('falls back to balance deltas when withdrawal logs cannot prove received amounts', () => {
+  const transferTopic = ethers.id('Transfer(address,address,uint256)');
+  const recipientTopic = ethers.zeroPadValue(WALLET, 32);
+  const senderTopic = ethers.zeroPadValue(ROUTER, 32);
+  assert.equal(erc20ReceivedAmounts({ logs: [] }, [TOKEN_IN, TOKEN_OUT], WALLET), null);
+  assert.equal(erc20ReceivedAmounts(
+    { logs: [{ address: TOKEN_IN, topics: [], data: '0x' }] },
+    [TOKEN_IN, TOKEN_OUT],
+    WALLET
+  ), null);
+  assert.equal(erc20ReceivedAmounts({
+    logs: [{
+      address: TOKEN_IN,
+      topics: [transferTopic, senderTopic, recipientTopic],
+      data: ethers.zeroPadValue(ethers.toBeHex(123n), 32)
+    }]
+  }, [TOKEN_IN, TOKEN_OUT], WALLET), null);
+});
+
 test('reuses a prepared swap only for the exact fresh token, amount and stablecoin', () => {
   const now = Date.parse('2026-07-25T00:00:02.000Z');
   const preloaded = {
@@ -442,6 +494,70 @@ test('transaction preparation relies on estimateGas without a duplicate eth_call
   assert.equal(prepared.nonce, 7);
   assert.equal(prepared.gasLimit, 120_000n);
   assert.equal(prepared.gasPrice, 100_000_000n);
+});
+
+test('signs a quorum-prepared withdrawal without a second RPC preparation pass', async () => {
+  const wallet = ethers.Wallet.createRandom();
+  let poolCalls = 0;
+  const prepared = await prepareTransaction({
+    wallet,
+    config: {
+      minGasPriceGwei: 0.1,
+      maxGasPriceGwei: 5,
+      maxGasLimit: 3_000_000
+    },
+    pool: {
+      call: async () => {
+        poolCalls += 1;
+        throw new Error('preflight fields should be reused');
+      }
+    }
+  }, {
+    to: ROUTER,
+    data: '0x1234',
+    value: 0n
+  }, {
+    nonce: 12,
+    estimatedGas: 200_000n,
+    gasPrice: ethers.parseUnits('0.1', 'gwei')
+  });
+
+  assert.equal(poolCalls, 0);
+  assert.equal(prepared.nonce, 12);
+  assert.equal(prepared.gasLimit, 240_000n);
+  assert.equal(ethers.Transaction.from(prepared.signed).nonce, 12);
+});
+
+test('prepares an OKX quoted transaction without another RPC estimation round trip', async () => {
+  const wallet = ethers.Wallet.createRandom();
+  let poolCalls = 0;
+  const prepared = await prepareQuotedTransaction({
+    wallet,
+    config: {
+      minGasPriceGwei: 0.1,
+      maxGasPriceGwei: 5,
+      maxGasLimit: 3_000_000
+    },
+    pool: {
+      call: async () => {
+        poolCalls += 1;
+        throw new Error('nonce RPC should be skipped when a concurrent hint is supplied');
+      }
+    }
+  }, {
+    to: ROUTER,
+    data: '0x1234',
+    value: 0n,
+    gas: 200_000n,
+    gasPrice: ethers.parseUnits('0.12', 'gwei')
+  }, 9);
+
+  assert.equal(poolCalls, 0);
+  assert.equal(prepared.nonce, 9);
+  assert.equal(prepared.gasLimit, 300_000n);
+  assert.equal(prepared.gasPrice, ethers.parseUnits('0.12', 'gwei'));
+  assert.equal(prepared.preparationSource, 'okx_quote');
+  assert.equal(ethers.Transaction.from(prepared.signed).nonce, 9);
 });
 
 test('honors a safe OKX fast gas suggestion above the configured floor', async () => {

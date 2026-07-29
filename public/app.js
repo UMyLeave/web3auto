@@ -204,38 +204,11 @@ function formatRaw(raw, decimals = 18, maxFraction = 8) {
   }
 }
 
-function formatLiquidity(value) {
-  if (value === undefined || value === null) return '-';
-  try {
-    return BigInt(value).toLocaleString('en-US');
-  } catch {
-    return String(value);
-  }
-}
-
 function formatDuration(ms) {
   if (ms === null || ms === undefined || ms === '') return '-';
   if (!Number.isFinite(Number(ms))) return '-';
   const value = Number(ms);
   return `${(value / 1000).toFixed(3)} 秒（${value} 毫秒）`;
-}
-
-function exchangeDurationText(action) {
-  if (action.manualResolution) return '外部手动处理，无法完整统计';
-  if (Number.isFinite(Number(action.swapDurationMs))) return formatDuration(action.swapDurationMs);
-  const measuredResults = (action.results || []).filter((result) =>
-    result.status !== 'skipped'
-    && result.status !== 'resolved_manually'
-    && Number.isFinite(Number(result.durationMs))
-  );
-  if (!measuredResults.length) return '-';
-  const derivedDurationMs = measuredResults.reduce((total, result) => total + Number(result.durationMs), 0);
-  return formatDuration(derivedDurationMs);
-}
-
-function nonCriticalDurationText(action) {
-  if (Number(action.timingVersion) < 2) return '旧记录未拆分';
-  return formatDuration(action.nonCriticalDurationMs);
 }
 
 function localTime(value) {
@@ -265,90 +238,38 @@ function renderExecutionSummary(action) {
     return;
   }
   const [stageText, stageTone] = actionStage(action);
-  const withdrawalState = action.withdrawTxHash
-    ? '成功提交并确认'
-    : action.stage === 'cancelled_external_position'
-      ? '未执行（检测到外部处理）'
-      : action.stage === 'failed_before_withdraw'
-        ? '未执行'
-        : '等待中';
-  const withdrawalLink = action.withdrawTxHash
-    ? `<a href="https://bscscan.com/tx/${escapeHtml(action.withdrawTxHash)}" target="_blank" rel="noreferrer">查看撤退交易 ↗</a>`
-    : '';
-  const resultRows = (action.results || []).map((result) => {
+  const exchangeRows = (action.results || []).filter((result) => {
+    const inputAddress = result.tokenIn?.toLowerCase();
+    return !inputAddress || inputAddress !== action.poolStablecoin?.toLowerCase();
+  }).map((result) => {
     const input = resultTokenMeta(action, result);
     const output = resultTokenMeta(action, result, true);
     const inputAmount = formatRaw(result.amountIn, input.decimals);
-    const outputRaw = result.actualReceived ?? result.quotedReceived;
-    const outputAmount = outputRaw !== undefined ? formatRaw(outputRaw, output.decimals) : '-';
     const confirmed = ['confirmed', 'confirmed_late'].includes(result.status);
     const resolvedManually = result.status === 'resolved_manually';
-    const skippedStable = result.status === 'skipped'
-      && input.address?.toLowerCase() === action.poolStablecoin?.toLowerCase();
-    const statusText = confirmed ? '兑换成功' : resolvedManually ? '已手动处理' : skippedStable ? '稳定币保留' : result.status === 'failed' ? '兑换失败' : '已跳过';
-    const tone = confirmed || skippedStable || resolvedManually ? 'success' : result.status === 'failed' ? 'failed' : 'neutral';
-    const route = resolvedManually
-      ? `${inputAmount} ${input.symbol} → 外部手动处理（到账未知）`
-      : skippedStable
-      ? `${inputAmount} ${input.symbol}（无需兑换）`
-      : `${inputAmount} ${input.symbol} → ${outputAmount} ${output.symbol}`;
-    const baseDetail = result.error || result.reason || (result.actualReceived ? '最终实际到账' : result.quotedReceived ? '显示 OKX 预计到账' : '');
-    const detail = result.preloadFallbackReason
-      ? `${baseDetail}${baseDetail ? '；' : ''}预准备回退：${result.preloadFallbackReason}`
-      : baseDetail;
-    const txLink = result.txHash
-      ? `<a href="https://bscscan.com/tx/${escapeHtml(result.txHash)}" target="_blank" rel="noreferrer">兑换交易 ↗</a>`
-      : result.approvalTxHash
-        ? `<a href="https://bscscan.com/tx/${escapeHtml(result.approvalTxHash)}" target="_blank" rel="noreferrer">授权交易 ↗</a>`
-        : '';
-    const durationText = resolvedManually
-      ? (Number.isFinite(Number(result.durationMs))
-        ? `脚本尝试耗时：${formatDuration(result.durationMs)}；外部耗时无法统计`
-        : '外部兑换耗时无法统计')
-      : skippedStable
-        ? '无需兑换'
-        : `兑换耗时：${formatDuration(result.durationMs)}${result.preparationMode === 'overlapped_with_withdraw_confirmation' ? ' · 已并行预准备' : ''}${result.approvalSource === 'armed_cache' ? ' · 已复用授权缓存' : ''}`;
-    return `<div class="swap-summary"><div><span class="result-status ${tone}">${statusText}</span><strong>${escapeHtml(route)}</strong><small>${escapeHtml(detail)}</small></div><div class="swap-side"><span>${escapeHtml(durationText)}</span>${txLink}</div></div>`;
+    const hasActualReceived = result.actualReceived !== undefined && result.actualReceived !== null;
+    let text;
+    if (confirmed && hasActualReceived) {
+      text = `${inputAmount} ${input.symbol} → ${formatRaw(result.actualReceived, output.decimals)} ${output.symbol}`;
+    } else if (confirmed) {
+      text = `${inputAmount} ${input.symbol} → 已确认，但未解析到实际到账`;
+    } else if (resolvedManually) {
+      text = `${inputAmount} ${input.symbol} → 已手动处理（到账未知）`;
+    } else if (result.status === 'failed') {
+      text = `${inputAmount} ${input.symbol} → 兑换失败`;
+    } else {
+      text = `${inputAmount} ${input.symbol} → 未完成兑换`;
+    }
+    return `<span>${escapeHtml(text)}</span>`;
   }).join('');
-  const stableMeta = resultTokenMeta(action, { tokenIn: action.poolStablecoin, toToken: action.poolStablecoin }, true);
-  const derivedStable = (action.results || []).reduce((total, result) => {
-    const isStableInput = result.tokenIn?.toLowerCase() === action.poolStablecoin?.toLowerCase();
-    const amount = result.actualReceived ?? (isStableInput && result.status === 'skipped' ? result.amountIn : '0');
-    try { return total + BigInt(amount || 0); } catch { return total; }
-  }, 0n);
-  const finalStableRaw = action.manualResolution
-    ? null
-    : action.finalStablecoinReceived ?? (derivedStable > 0n ? derivedStable.toString() : null);
-  const totalStable = finalStableRaw ? `${formatRaw(finalStableRaw, stableMeta.decimals)} ${stableMeta.symbol}` : '-';
-  const trigger = action.trigger;
-  const affectedTargets = trigger?.affectedTargets?.length ? trigger.affectedTargets : (trigger ? [trigger] : []);
-  const triggerTarget = affectedTargets.length
-    ? affectedTargets.map((item) => `NFT #${item.targetNftId}`).join('、')
-    : '-';
-  const triggerChange = affectedTargets.length
-    ? affectedTargets.map((item) =>
-      `#${item.targetNftId}: ${formatLiquidity(item.previousLiquidity)} → ${formatLiquidity(item.currentLiquidity)}（减少 ${formatLiquidity(item.decreasedBy)}）`
-    ).join('；')
-    : '-';
+  const outcomeDetail = action.error || action.reason || '';
   $('result').innerHTML = `
-    <div class="result-hero">
-      <div><span class="result-status ${stageTone}">${escapeHtml(stageText)}</span><strong>NFT #${escapeHtml(action.myNftId)}</strong></div>
-      <span>${escapeHtml(localTime(action.completedAt || action.detectedAt))}</span>
-    </div>
-    <div class="result-facts">
-      <div><span>检测时间</span><strong>${escapeHtml(localTime(action.detectedAt))}</strong></div>
-      <div><span>触发目标</span><strong>${escapeHtml(triggerTarget)}</strong></div>
-      <div><span>目标流动性变化</span><strong>${escapeHtml(triggerChange)}</strong></div>
-      <div><span>撤退状态</span><strong>${escapeHtml(withdrawalState)}</strong>${withdrawalLink}</div>
-      <div><span>撤退耗时</span><strong>${escapeHtml(formatDuration(action.withdrawDurationMs))}</strong></div>
-      <div><span>兑换耗时</span><strong>${escapeHtml(exchangeDurationText(action))}</strong></div>
-      <div><span>${Number(action.timingVersion) >= 2 ? '关键总耗时' : '原总流程耗时（旧口径）'}</span><strong>${escapeHtml(formatDuration(action.totalDurationMs))}</strong></div>
-      <div class="noncritical-time"><span>确认 / 核验耗时（不重要）</span><strong>${escapeHtml(nonCriticalDurationText(action))}</strong><small>交易入块后的等待，不计入关键总耗时</small></div>
-      <div><span>最终获得稳定币</span><strong>${escapeHtml(totalStable)}</strong></div>
-    </div>
-    <div class="swap-list">${resultRows || '<div class="result-empty">尚无资产处理结果</div>'}</div>
-    ${action.reason ? `<div class="result-notice"><strong>监控已安全停止</strong><span>${escapeHtml(action.reason)}</span></div>` : ''}
-    ${action.error ? `<div class="result-error"><strong>需要处理</strong><span>${escapeHtml(action.error)}</span></div>` : ''}
+    <dl class="execution-result">
+      <div><dt>NFT ID</dt><dd>#${escapeHtml(action.myNftId || '-')}</dd></div>
+      <div><dt>脚本实际结果</dt><dd><span class="result-status ${stageTone}">${escapeHtml(stageText)}</span>${outcomeDetail ? `<small>${escapeHtml(outcomeDetail)}</small>` : ''}</dd></div>
+      <div><dt>耗时（不含确认）</dt><dd>${escapeHtml(formatDuration(action.totalDurationMs))}</dd></div>
+      <div><dt>兑换结果</dt><dd class="exchange-result">${exchangeRows || '<span>未发生代币兑换</span>'}</dd></div>
+    </dl>
   `;
 }
 
@@ -423,18 +344,8 @@ async function refresh() {
     $('running').textContent = status.arming ? '布防准备中' : status.inFlight ? '交易执行中' : (status.running ? '运行中' : '已停止');
     $('block').textContent = status.lastBlock ?? latestPositions?.block ?? '-';
     $('error').textContent = status.error || status.mineHealthWarning || status.guardNotice?.message || status.monitorWarning || '';
-    document.querySelectorAll('#updated, #lastCompleted').forEach((node) => {
-      node.textContent = localTime(status.lastAction?.completedAt || status.lastAction?.detectedAt);
-    });
+    $('updated').textContent = localTime(status.lastAction?.completedAt || status.lastAction?.detectedAt);
     renderExecutionSummary(status.lastAction);
-    const actionStable = status.lastAction?.poolStablecoin;
-    const actionStableMeta = actionStable
-      ? resultTokenMeta(status.lastAction, { tokenIn: actionStable, toToken: actionStable }, true)
-      : null;
-    const positionStable = aggregateTargetAmounts(
-      latestPositions?.targets || (latestPositions?.target ? [latestPositions.target] : [])
-    ).find((item) => item.isStablecoin);
-    $('stablecoinStatus').textContent = actionStableMeta?.symbol || positionStable?.symbol || config.stablecoin?.symbol || '-';
     updateButtons(status);
     notifyStageChange(status);
     notifyGuardNotice(status);
@@ -522,12 +433,12 @@ function updateTargetMetric(targets) {
     $('targetPosition').textContent = '-';
     return;
   }
-  const stable = amounts.find((item) => item.isStablecoin);
-  const token = amounts.find((item) => !item.isStablecoin);
-  $('targetPosition').innerHTML = [
-    stable ? `<span>${escapeHtml(displayPositionAmount(stable))}</span>` : '',
-    token ? `<span>${escapeHtml(displayPositionAmount(token))}</span>` : ''
-  ].filter(Boolean).join('<span class="metric-separator">·</span>');
+  const orderedAmounts = [...amounts].sort((left, right) =>
+    Number(right.isStablecoin) - Number(left.isStablecoin)
+  );
+  $('targetPosition').innerHTML = orderedAmounts
+    .map((amount) => `<span>${escapeHtml(displayPositionAmount(amount))}</span>`)
+    .join('<span class="metric-separator">·</span>');
   $('targetPositionDetail').textContent = `${targets.length} 个目标 NFT · 合计预计可撤本金`;
 }
 
@@ -567,8 +478,6 @@ async function lookupPositions({ silent = false } = {}) {
       .join('');
     $('positionPreview').innerHTML = `<div class="preview-summary">${poolState}<span>共 ${escapeHtml(targets.length)} 个目标 · 最终区块 ${escapeHtml(data.block)} · 数量为预计本金，不含未领取手续费</span></div><div class="position-grid">${targetCards}${renderPosition('我的仓位', myNftId, data.mine, 'mine')}</div>`;
     updateTargetMetric(targets);
-    const stable = aggregateTargetAmounts(targets).find((item) => item.isStablecoin);
-    if (stable) $('stablecoinStatus').textContent = stable.symbol;
   } catch (error) {
     if (sequence !== lookupSequence) return;
     if (!silent) $('positionPreview').innerHTML = `<div class="preview-error">${escapeHtml(error.message)}</div>`;

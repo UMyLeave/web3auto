@@ -1,0 +1,45 @@
+{
+  "_comment": "初始化流动性功能的独立配置，不参与仓位监控、撤退或兑换流程。",
+  "positionManager": "0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b",
+  "stablecoins": [
+    {
+      "symbol": "USDT",
+      "address": "0x55d398326f99059fF775485246999027B3197955"
+    },
+    {
+      "symbol": "USD1",
+      "address": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"
+    },
+    {
+      "symbol": "USDC",
+      "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+    },
+    {
+      "symbol": "U",
+      "address": "0xcE24439F2D9C6a2289F741120FE202248B666666"
+    }
+  ],
+  "rpcUrls": [
+    "https://bsc.rpc.blxrbdn.com",
+    "https://bsc-dataseed.bnbchain.org",
+    "https://bsc-dataseed3.defibit.io",
+    "https://bsc-dataseed4.defibit.io",
+    "https://bsc-dataseed4.bnbchain.org",
+    "https://bsc.api.pocket.network"
+  ],
+  "rpcTimeoutMs": 5000,
+  "okxRequestTimeoutMs": 8000,
+  "okxRequestAttempts": 2,
+  "transactionTimeoutMs": 90000,
+  "receiptConfirmations": 1,
+  "previewValiditySeconds": 120,
+  "swapSlippageBps": 100,
+  "maxSwapValueLossPercent": 5,
+  "minGasPriceGwei": 0.1,
+  "maxGasPriceGwei": 5,
+  "maxGasLimit": 3000000,
+  "maxStableBudget": 1000,
+  "maxFeePercent": 10,
+  "permit2ExpirationSeconds": 3600,
+  "transactionDeadlineSeconds": 180
+}
