@@ -6,11 +6,17 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "hook:compile": "node scripts/compile-whitelist-hook.js",
+    "hook:prepare": "node scripts/prepare-whitelist-hook.js",
+    "hook:deploy": "node scripts/deploy-whitelist-hook.js",
     "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "ethers": "^6.15.0",
     "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "solc": "0.8.26"
   }
 }

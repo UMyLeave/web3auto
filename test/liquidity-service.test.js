@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ethers } from 'ethers';
 import {
+  actionMayHaveMintedPosition,
+  applyActionPositionReconciliation,
   assertExecutionPlanInvariant,
   assertLiquidityPreviewAuthorization,
   assertPoolAvailableForCreation,
@@ -10,6 +12,7 @@ import {
   encodeLiquidityTransaction,
   encodeMintLiquidity,
   exactAllowanceActions,
+  findActionTargetPoolPositions,
   integerSqrt,
   liquidityExecutionFingerprint,
   liquidityRangeTicks,
@@ -232,6 +235,109 @@ test('creation-only preflight rejects an already initialized exact PoolKey', () 
   );
 });
 
+test('failed liquidity execution releases the task when no target-pool NFT exists', () => {
+  const action = {
+    stage: 'needs_attention',
+    poolId: `0x${'12'.repeat(32)}`,
+    currentTx: { kind: 'permit2_position_manager', hash: `0x${'34'.repeat(32)}` },
+    error: 'timeout'
+  };
+  applyActionPositionReconciliation(action, [], {
+    checkedAt: '2026-08-01T07:00:00.000Z'
+  });
+  assert.equal(action.stage, 'failed');
+  assert.equal(action.currentTx, null);
+  assert.equal(action.positionReconciliation.found, false);
+  assert.match(action.error, /未发现本次目标池 NFT 仓位.*解除新任务阻塞/);
+  assert.equal(action.unconfirmedTransactions[0].status, 'not_confirmed_before_position_check');
+});
+
+test('only a submitted mint transaction requires NFT reconciliation', () => {
+  assert.equal(actionMayHaveMintedPosition({
+    currentTx: { kind: 'permit2_position_manager', hash: `0x${'12'.repeat(32)}` }
+  }), false);
+  assert.equal(actionMayHaveMintedPosition({
+    currentTx: { kind: 'mint_liquidity', hash: `0x${'34'.repeat(32)}` }
+  }), true);
+  assert.equal(actionMayHaveMintedPosition({
+    currentTx: null,
+    liquidityTxHash: `0x${'56'.repeat(32)}`
+  }), true);
+});
+
+test('failed liquidity execution records a detected target-pool NFT', () => {
+  const action = {
+    stage: 'needs_attention',
+    poolId: `0x${'56'.repeat(32)}`,
+    currentTx: { kind: 'mint_liquidity', hash: `0x${'78'.repeat(32)}` },
+    error: 'timeout'
+  };
+  applyActionPositionReconciliation(action, [{ nftId: '1234', liquidity: '99' }], {
+    checkedAt: '2026-08-01T07:00:00.000Z'
+  });
+  assert.equal(action.stage, 'completed');
+  assert.equal(action.currentTx, null);
+  assert.equal(action.nftId, '1234');
+  assert.deepEqual(action.nftIds, ['1234']);
+  assert.equal(action.positionReconciliation.found, true);
+  assert.equal(action.error, null);
+});
+
+test('position reconciliation accepts only an owned active NFT from the target pool', async () => {
+  const positionManager = '0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b';
+  const targetPoolKey = {
+    currency0: TRADE,
+    currency1: QUOTE,
+    fee: 1489,
+    tickSpacing: 10,
+    hooks: ethers.ZeroAddress
+  };
+  const managerInterface = new ethers.Interface([
+    'function ownerOf(uint256 tokenId) view returns (address)',
+    'function getPositionLiquidity(uint256 tokenId) view returns (uint128)',
+    'function getPoolAndPositionInfo(uint256 tokenId) view returns ((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks),uint256 info)'
+  ]);
+  const nftId = 1234n;
+  const fakeProvider = {
+    getBlockNumber: async () => 120,
+    getLogs: async () => [{
+      address: positionManager,
+      topics: [
+        ethers.id('Transfer(address,address,uint256)'),
+        ethers.zeroPadValue(ethers.ZeroAddress, 32),
+        ethers.zeroPadValue(OWNER, 32),
+        ethers.toBeHex(nftId, 32)
+      ],
+      data: '0x'
+    }],
+    call: async (transaction) => {
+      const selector = transaction.data.slice(0, 10);
+      if (selector === managerInterface.getFunction('ownerOf').selector) {
+        return managerInterface.encodeFunctionResult('ownerOf', [OWNER]);
+      }
+      if (selector === managerInterface.getFunction('getPositionLiquidity').selector) {
+        return managerInterface.encodeFunctionResult('getPositionLiquidity', [99n]);
+      }
+      if (selector === managerInterface.getFunction('getPoolAndPositionInfo').selector) {
+        return managerInterface.encodeFunctionResult(
+          'getPoolAndPositionInfo',
+          [targetPoolKey, 0n]
+        );
+      }
+      throw new Error(`unexpected selector ${selector}`);
+    }
+  };
+  const positions = await findActionTargetPoolPositions(fakeProvider, {
+    positionManager
+  }, {
+    wallet: OWNER,
+    poolId: poolIdOf(targetPoolKey),
+    startedBlockNumber: 100,
+    transactions: []
+  });
+  assert.deepEqual(positions, [{ nftId: '1234', liquidity: '99' }]);
+});
+
 test('execution requires a fresh preview for the exact normalized request and wallet', () => {
   const input = normalizeLiquidityInput({
     tradeToken: TRADE,
@@ -368,6 +474,31 @@ test('liquidity input enforces quote whitelist and stable-input safety cap', () 
   assert.equal(normalized.fee, 3000);
   assert.equal(normalized.budget, '20');
   assert.equal(normalized.quoteSymbol, 'USDT');
+
+  for (const [feePercent, expectedFee] of [['0.1489', 1489], ['0.1488', 1488]]) {
+    const preciseFee = normalizeLiquidityInput({
+      tradeToken: TRADE,
+      quoteToken: QUOTE,
+      price: '1',
+      budget: '20',
+      feePercent,
+      tickSpacing: '1',
+      rangeType: 'percent',
+      rangePercent: '90',
+      hooks: ethers.ZeroAddress
+    }, config);
+    assert.equal(preciseFee.fee, expectedFee);
+    assert.equal(preciseFee.feePercent, Number(feePercent));
+  }
+
+  assert.throws(() => normalizeLiquidityInput({
+    tradeToken: TRADE,
+    quoteToken: QUOTE,
+    price: '1',
+    budget: '20',
+    feePercent: '0.14891',
+    tickSpacing: '1'
+  }, config), /最多支持 4 位小数/);
 
   assert.throws(() => normalizeLiquidityInput({
     tradeToken: TRADE,

@@ -1,6 +1,16 @@
 {
   "_comment": "初始化流动性功能的独立配置，不参与仓位监控、撤退或兑换流程。",
   "positionManager": "0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b",
+  "whitelistHook": {
+    "label": "白名单 Hooks v2",
+    "policyVersion": 2,
+    "address": "0x2D3CAd766Ba4EC4bDaF1dF496E2a90A47b5b0800",
+    "allowedWallets": [
+      "0xda83171fe04C97f029a3AA71ef260B30f03aB521",
+      "0x3aae50a45099b269588e842c1f7418e58d9b4fd3"
+
+    ]
+  },
   "stablecoins": [
     {
       "symbol": "USDT",

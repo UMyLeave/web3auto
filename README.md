@@ -22,6 +22,23 @@ npm start
 
 初始化页面只负责创建新池，不会向已有池继续添加流动性。预检会查询由交易代币、稳定币、费率、Tick Spacing 和 Hooks 组成的精确 PoolKey；若该池已存在，直接停止。更换稳定币会产生不同 PoolKey，可以正常创建。预检还会检查 OKX 返回的输入币和目标币 `taxRate`；任一币种带税或税率信息缺失时都会在兑换前停止，因为标准 Uniswap v4 PositionManager 要求代币精确结算。失败任务不会自动续跑，执行记录、钱包资产和链上授权会保留。
 
+### 白名单 Hooks
+
+`liquidity-config.json` 的 `whitelistHook.allowedWallets` 是白名单 Hooks 的部署参数，数组中只保存公开钱包地址，默认包含当前执行钱包。v2 Hook 只启用 `beforeAddLiquidity`：回调必须来自绑定的官方 PositionManager，并以最终仓位 NFT Owner 作为白名单身份，因此兼容通过第三方平台合约调用同一 PositionManager 的场景；撤出流动性不受限制。Hooks 地址低 14 位必须精确等于 `0x0800`，部署脚本会使用 BSC 标准 CREATE2 部署器计算地址。
+
+```bash
+npm run hook:compile
+npm run hook:prepare
+```
+
+`hook:prepare` 只有链上读取、编译、地址挖掘和 Gas 模拟能力，不会签名或发送交易。真实部署必须同时在 `.env` 设置独立开关 `HOOK_DEPLOY=true`，并显式执行：
+
+```bash
+npm run hook:deploy -- --broadcast
+```
+
+部署成功后脚本才会把合约地址写入 `liquidity-config.json`，页面下拉框中的“白名单 Hooks”才可选择。白名单在构造时固化，本地修改数组不会改变已经部署的合约；修改名单必须重新部署 Hook，并使用新的 Hook 地址创建新池。一个已部署 Hook 可供多个池复用，这些池共享同一份固定白名单。池子初始化后不能替换 Hook。白名单约束发生在增加流动性时；PositionManager 的 LP NFT 仍可转让，但转让给非白名单地址后不能继续增加流动性，移除已有流动性仍保持可用。
+
 ## 重要限制
 
 - WSS 新区块通知会立即唤醒仓位和交易回执检查，HTTP 轮询每 `450ms` 监控仓位并以 `receiptPollIntervalMs` 兜底查询回执；所有目标仓位默认在同一区块读取 BSC `latest` 状态，并要求至少 2 个独立 HTTP RPC 对整组流动性返回一致结果。RPC 按历史延迟、失败次数、正在处理的请求和冷却状态排序，连续失败节点会暂时移出热路径。

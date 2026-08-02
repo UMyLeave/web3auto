@@ -8,6 +8,10 @@ import {
   prepareStableToTradeSwap,
   quoteStableToTrade
 } from './liquidity-swap-service.js';
+import {
+  publicHookPresets,
+  verifyConfiguredWhitelistHook
+} from './liquidity-hook-service.js';
 
 const CHAIN_ID = 56n;
 const ZERO = ethers.ZeroAddress;
@@ -25,6 +29,9 @@ const POSITION_ABI = [
   'function poolManager() view returns (address)',
   'function permit2() view returns (address)',
   'function nextTokenId() view returns (uint256)',
+  'function getPositionLiquidity(uint256 tokenId) view returns (uint128)',
+  'function getPoolAndPositionInfo(uint256 tokenId) view returns ((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks),uint256 info)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
   'function initializePool((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint160 sqrtPriceX96) payable returns (int24)',
   'function modifyLiquidities(bytes unlockData,uint256 deadline) payable',
   'function multicall(bytes[] data) payable returns (bytes[] results)'
@@ -447,7 +454,11 @@ export function normalizeLiquidityInput(body, config) {
   }
 
   const feeFraction = decimalFraction(body.feePercent, 'V4 费率');
-  const fee = Number((feeFraction.numerator * 10_000n + feeFraction.denominator / 2n) / feeFraction.denominator);
+  const feeDecimals = feeFraction.text.split('.')[1] || '';
+  if (feeDecimals.length > 4) {
+    throw new Error('V4 费率最多支持 4 位小数（最小精度 0.0001%）');
+  }
+  const fee = Number(feeFraction.numerator * 10_000n / feeFraction.denominator);
   const maxFee = Number(config.maxFeePercent ?? 10);
   if (!Number.isSafeInteger(fee) || fee <= 0 || fee > maxFee * 10_000) {
     throw new Error(`V4 费率必须大于 0 且不超过 ${maxFee}%`);
@@ -665,6 +676,16 @@ async function buildPlan(
   if (input.hooks !== ZERO) {
     const hookCode = await provider.getCode(input.hooks);
     if (!hookCode || hookCode === '0x') throw new Error('自定义 Hooks 地址没有部署合约代码');
+    if (owner) {
+      await verifyConfiguredWhitelistHook({
+        provider,
+        config,
+        selectedHook: input.hooks,
+        walletAddress: owner,
+        positionManager: positionManagerAddress,
+        poolManager: poolManagerAddress
+      });
+    }
   }
 
   const tradeIsCurrency0 = BigInt(trade.address) < BigInt(quote.address);
@@ -1205,6 +1226,135 @@ function mintedTokenId(receipt, positionManager, owner) {
   return null;
 }
 
+function actionPositionScanStartBlock(action, headBlock) {
+  const explicit = Number(action?.startedBlockNumber);
+  if (Number.isSafeInteger(explicit) && explicit >= 0) return Math.min(explicit, headBlock);
+  const initialization = action?.transactions?.find((entry) => (
+    entry.kind === 'initialize_pool'
+      && entry.blockNumber !== null
+      && entry.blockNumber !== undefined
+  ));
+  const initializationBlock = Number(initialization?.blockNumber);
+  if (Number.isSafeInteger(initializationBlock) && initializationBlock >= 0) {
+    return Math.min(initializationBlock, headBlock);
+  }
+  return Math.max(0, headBlock - 20_000);
+}
+
+async function incomingPositionTokenIds(
+  provider,
+  positionManager,
+  owner,
+  fromBlock,
+  toBlock
+) {
+  const ownerTopic = ethers.zeroPadValue(owner, 32);
+  const ids = new Set();
+  const blockChunk = 2_000;
+  for (let start = fromBlock; start <= toBlock; start += blockChunk) {
+    const end = Math.min(toBlock, start + blockChunk - 1);
+    const logs = await provider.getLogs({
+      address: positionManager,
+      fromBlock: start,
+      toBlock: end,
+      topics: [ERC721_TRANSFER_TOPIC, null, ownerTopic]
+    });
+    for (const log of logs) {
+      if (log.topics?.[3]) ids.add(BigInt(log.topics[3]).toString());
+    }
+  }
+  return [...ids].sort((left, right) => (
+    BigInt(left) < BigInt(right) ? -1 : (BigInt(left) > BigInt(right) ? 1 : 0)
+  ));
+}
+
+export async function findActionTargetPoolPositions(provider, config, action) {
+  const positionManagerAddress = ethers.getAddress(config.positionManager);
+  const owner = ethers.getAddress(action.wallet);
+  const targetPoolId = String(action.poolId || action.plan?.poolId || '').toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(targetPoolId)) throw new Error('待核对任务缺少有效 Pool ID');
+
+  const headBlock = await provider.getBlockNumber();
+  const fromBlock = actionPositionScanStartBlock(action, headBlock);
+  const tokenIds = await incomingPositionTokenIds(
+    provider,
+    positionManagerAddress,
+    owner,
+    fromBlock,
+    headBlock
+  );
+  if (!tokenIds.length) return [];
+
+  const manager = new ethers.Contract(positionManagerAddress, POSITION_ABI, provider);
+  const positions = [];
+  const batchSize = 12;
+  for (let offset = 0; offset < tokenIds.length; offset += batchSize) {
+    const batch = tokenIds.slice(offset, offset + batchSize);
+    const inspected = await Promise.allSettled(batch.map(async (nftId) => {
+      const [currentOwner, details, liquidity] = await Promise.all([
+        manager.ownerOf(nftId),
+        manager.getPoolAndPositionInfo(nftId),
+        manager.getPositionLiquidity(nftId)
+      ]);
+      if (ethers.getAddress(currentOwner) !== owner || BigInt(liquidity) <= 0n) return null;
+      if (poolIdOf(details[0]).toLowerCase() !== targetPoolId) return null;
+      return { nftId, liquidity: BigInt(liquidity).toString() };
+    }));
+    for (const result of inspected) {
+      if (result.status === 'fulfilled' && result.value) positions.push(result.value);
+    }
+  }
+  return positions;
+}
+
+export function applyActionPositionReconciliation(action, positions, options = {}) {
+  const checkedAt = options.checkedAt || new Date().toISOString();
+  const noPositionStage = options.noPositionStage || 'failed';
+  const nftIds = positions.map((position) => String(position.nftId));
+  if (action.currentTx?.hash) {
+    action.unconfirmedTransactions ||= [];
+    if (!action.unconfirmedTransactions.some((entry) => entry.hash === action.currentTx.hash)) {
+      action.unconfirmedTransactions.push({
+        ...action.currentTx,
+        status: 'not_confirmed_before_position_check',
+        checkedAt
+      });
+    }
+  }
+  action.currentTx = null;
+  action.positionReconciliation = {
+    checkedAt,
+    poolId: action.poolId || action.plan?.poolId || null,
+    found: nftIds.length > 0,
+    nftIds,
+    positions
+  };
+
+  if (nftIds.length) {
+    action.stage = 'completed';
+    action.nftId = nftIds[0];
+    action.nftIds = nftIds;
+    action.error = null;
+    action.completedAt = checkedAt;
+    action.resolution = `执行异常后链上检测到目标池 NFT #${nftIds.join('、')}`;
+    return action;
+  }
+
+  const originalError = String(options.errorMessage || action.error || '加池流程未完成')
+    .split('；链上未发现本次目标池 NFT')[0];
+  action.stage = noPositionStage;
+  action.error = `${originalError}；链上未发现本次目标池 NFT 仓位，已解除新任务阻塞`;
+  action.resolution = '未发现目标池 NFT 仓位，保留钱包资产和链上授权并放行新任务';
+  action.failedAt ||= checkedAt;
+  if (noPositionStage === 'cancelled') action.resolvedAt = checkedAt;
+  return action;
+}
+
+export function actionMayHaveMintedPosition(action) {
+  return action?.currentTx?.kind === 'mint_liquidity'
+    || Boolean(action?.liquidityTxHash);
+}
+
 function actionPlanSummary(plan) {
   return {
     poolId: plan.pool.poolId,
@@ -1315,6 +1465,41 @@ export function createLiquidityRouter({
         lastAction.stage = 'needs_attention';
         lastAction.error ||= '服务曾在加池流程中断，请先核对已广播交易';
         await writeJsonAtomic(actionPath, lastAction);
+        if (!actionMayHaveMintedPosition(lastAction)) {
+          applyActionPositionReconciliation(lastAction, [], {
+            errorMessage: lastAction.error,
+            noPositionStage: 'failed'
+          });
+          await writeJsonAtomic(actionPath, lastAction);
+          return;
+        }
+        let reconciliationProvider;
+        try {
+          const config = await readJson(configPath);
+          reconciliationProvider = await openProvider(config);
+          const positions = await findActionTargetPoolPositions(
+            reconciliationProvider,
+            config,
+            lastAction
+          );
+          applyActionPositionReconciliation(lastAction, positions, {
+            errorMessage: lastAction.error,
+            noPositionStage: 'failed'
+          });
+          await writeJsonAtomic(actionPath, lastAction);
+        } catch (reconciliationError) {
+          lastAction.positionReconciliation = {
+            checkedAt: new Date().toISOString(),
+            poolId: lastAction.poolId || lastAction.plan?.poolId || null,
+            found: false,
+            nftIds: [],
+            positions: [],
+            error: reconciliationError.message
+          };
+          await writeJsonAtomic(actionPath, lastAction);
+        } finally {
+          reconciliationProvider?.destroy();
+        }
       } else if (interrupted || lastAction.stage === 'needs_attention') {
         lastAction.stage = 'failed';
         lastAction.error = lastAction.error
@@ -1350,6 +1535,7 @@ export function createLiquidityRouter({
         maxStableBudget: Number(config.maxStableBudget ?? 1000),
         maxFeePercent: Number(config.maxFeePercent ?? 10),
         positionManager: ethers.getAddress(config.positionManager),
+        hookPresets: publicHookPresets(config, walletAddress),
         walletAddress,
         privateKeyConfigured: Boolean(walletAddress),
         autoAllocationConfigured: okxCredentialsConfigured(environment),
@@ -1562,11 +1748,13 @@ export function createLiquidityRouter({
       );
       assertExecutionPlanInvariant(quotedPlan, previewAuthorization);
       previewAuthorizations.delete(previewAuthorization.id);
+      const startedBlockNumber = await provider.getBlockNumber();
 
       action = {
         id: crypto.randomUUID(),
         stage: 'initializing',
         startedAt: new Date().toISOString(),
+        startedBlockNumber,
         wallet: wallet.address,
         poolId: quotedPlan.pool.poolId,
         request: {
@@ -1855,12 +2043,25 @@ export function createLiquidityRouter({
             error = new Error(`${error.message}；同时清理兑换授权失败：${cleanupError.message}`);
           }
         }
-        action.stage = action.currentTx?.hash ? 'needs_attention' : 'failed';
-        action.error = error.message;
-        action.failedAt = new Date().toISOString();
+        let positionReconciled = false;
+        try {
+          const positions = actionMayHaveMintedPosition(action)
+            ? await findActionTargetPoolPositions(provider, config, action)
+            : [];
+          applyActionPositionReconciliation(action, positions, {
+            errorMessage: error.message,
+            noPositionStage: 'failed'
+          });
+          positionReconciled = true;
+        } catch (positionError) {
+          action.stage = action.currentTx?.hash ? 'needs_attention' : 'failed';
+          action.error = `${error.message}；自动核对目标池 NFT 失败：${positionError.message}`;
+          action.failedAt = new Date().toISOString();
+        }
         await persist(action);
+        if (positionReconciled && action.stage === 'completed') return res.json(action);
       }
-      res.status(400).json({ error: error.message, action: action || null });
+      res.status(400).json({ error: action?.error || error.message, action: action || null });
     } finally {
       inFlight = false;
       provider?.destroy();
@@ -1868,21 +2069,30 @@ export function createLiquidityRouter({
   });
 
   router.post('/resolve', async (req, res) => {
+    let provider;
     try {
       await ready;
-      if (req.body.confirmed !== true) throw new Error('必须确认结束待处理任务');
+      if (req.body.confirmed !== true) throw new Error('必须确认核对仓位并处理待确认任务');
       if (inFlight) throw new Error('加池任务执行中，不能结束记录');
       if (lastAction?.stage !== 'needs_attention') throw new Error('当前没有待处理任务');
-      if (lastAction.currentTx?.hash || lastAction.liquidityTxHash) {
-        throw new Error('记录中存在待核对的加池交易哈希，不能直接结束');
+      inFlight = true;
+      const config = await readJson(configPath);
+      let positions = [];
+      if (actionMayHaveMintedPosition(lastAction)) {
+        provider = await openProvider(config);
+        positions = await findActionTargetPoolPositions(provider, config, lastAction);
       }
-      lastAction.stage = 'cancelled';
-      lastAction.resolvedAt = new Date().toISOString();
-      lastAction.resolution = '保留已兑换资产和链上授权，结束本次加池任务';
+      applyActionPositionReconciliation(lastAction, positions, {
+        errorMessage: lastAction.error,
+        noPositionStage: 'cancelled'
+      });
       await persist(lastAction);
       res.json(lastAction);
     } catch (error) {
       res.status(400).json({ error: error.message });
+    } finally {
+      inFlight = false;
+      provider?.destroy();
     }
   });
 

@@ -79,7 +79,7 @@
           <div class="two-column">
             <label class="liquidity-field" for="feePercent">
               <span>V4 费率 %</span>
-              <input id="feePercent" name="feePercent" type="number" min="0" step="0.01"
+              <input id="feePercent" name="feePercent" type="number" min="0" step="0.0001"
                 inputmode="decimal" value="0.3">
             </label>
             <label class="liquidity-field" for="tickSpacing">
@@ -138,11 +138,20 @@
             <span>Hooks</span>
             <small>默认无需设置；自定义 Hooks 会执行外部合约逻辑</small>
           </div>
-          <label class="liquidity-field" for="hooks">
-            <span>Hooks 合约地址</span>
-            <input id="hooks" name="hooks" spellcheck="false" autocomplete="off"
-              value="0x0000000000000000000000000000000000000000">
-          </label>
+          <div class="hooks-grid">
+            <label class="liquidity-field" for="hooks">
+              <span>Hooks 合约地址</span>
+              <input id="hooks" name="hooks" spellcheck="false" autocomplete="off"
+                value="0x0000000000000000000000000000000000000000">
+            </label>
+            <label class="liquidity-field" for="hooksPreset">
+              <span>Hooks 选择</span>
+              <select id="hooksPreset">
+                <option value="">空（不携带 Hooks）</option>
+              </select>
+              <small id="hooksPresetHint">初始化时不携带 Hooks</small>
+            </label>
+          </div>
           <label id="hooksAcknowledge" class="risk-confirm conditional-field">
             <input id="acknowledgeCustomHooks" type="checkbox">
             <span>我已核对自定义 Hooks 合约及其权限，并确认承担外部合约执行风险</span>
@@ -161,16 +170,40 @@
           <div class="summary-heading">
             <div>
               <span>执行预览</span>
-              <small>不会在预检阶段广播交易</small>
+              <small>建池完成后立即更新池子信息</small>
             </div>
             <span id="previewState" class="summary-badge">待预检</span>
           </div>
-          <div id="previewResult" class="summary-empty">
-            填写参数后进行只读预检，这里会显示池状态、稳定币自动分配、区间和授权需求。
+          <div class="execution-preview-blocks">
+            <section class="execution-preview-block" aria-labelledby="poolBlockTitle">
+              <div class="execution-block-heading">
+                <div>
+                  <span class="execution-step">1</span>
+                  <strong id="poolBlockTitle">池子信息</strong>
+                </div>
+                <span id="poolStageState" class="summary-badge">待预检</span>
+              </div>
+              <div id="poolResult" class="summary-empty" aria-live="polite">
+                预检后显示 PoolKey；池子确认创建后立即显示 Pool ID 和建池交易。
+              </div>
+            </section>
+
+            <section class="execution-preview-block" aria-labelledby="positionBlockTitle">
+              <div class="execution-block-heading">
+                <div>
+                  <span class="execution-step">2</span>
+                  <strong id="positionBlockTitle">兑换与仓位</strong>
+                </div>
+                <span id="positionStageState" class="summary-badge">等待池子</span>
+              </div>
+              <div id="positionResult" class="summary-empty" aria-live="polite">
+                池子创建后显示兑换、授权和最终 NFT 仓位进度。
+              </div>
+            </section>
           </div>
           <div id="actionControls" class="action-controls" hidden>
             <button id="resolveActionButton" class="danger-button" type="button">
-              结束本次任务
+              核对仓位并放行
             </button>
           </div>
         </section>

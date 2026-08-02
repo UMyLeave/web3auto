@@ -301,8 +301,15 @@ button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.hooks-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(210px, .8fr);
+  gap: 12px;
+}
+
 .quote-grid .liquidity-field + .liquidity-field,
-.two-column .liquidity-field + .liquidity-field {
+.two-column .liquidity-field + .liquidity-field,
+.hooks-grid .liquidity-field + .liquidity-field {
   margin-top: 0;
 }
 
@@ -467,6 +474,111 @@ button {
   color: #f39a94;
 }
 
+.summary-badge.loading {
+  border-color: #61501d;
+  background: #1d190e;
+  color: #d8bd62;
+}
+
+.execution-preview-blocks {
+  display: grid;
+  gap: 12px;
+  padding-top: 16px;
+}
+
+.execution-preview-block {
+  overflow: hidden;
+  border: 1px solid #2d3035;
+  border-radius: 8px;
+  background: #101113;
+}
+
+.execution-block-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 12px;
+  border-bottom: 1px solid #2b2d31;
+  background: #17191c;
+}
+
+.execution-block-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.execution-block-heading strong {
+  color: #dfe1e4;
+  font-size: 11px;
+}
+
+.execution-step {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid #554719;
+  border-radius: 50%;
+  background: #211d0e;
+  color: #e6c352;
+  font-size: 9px;
+  font-weight: 850;
+}
+
+.execution-preview-block .summary-empty {
+  padding: 15px 12px;
+}
+
+.execution-preview-block .preview-stack,
+.execution-preview-block .execution-result {
+  padding: 12px;
+}
+
+.execution-preview-block .preview-error {
+  margin: 12px;
+}
+
+.execution-loading {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 15px 12px;
+}
+
+.execution-loading > span {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border: 2px solid #4b4120;
+  border-top-color: #e0bd45;
+  border-radius: 50%;
+  animation: liquidity-spin .8s linear infinite;
+}
+
+.execution-loading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.execution-loading strong {
+  color: #d8dadd;
+  font-size: 10px;
+}
+
+.execution-loading small {
+  color: #737880;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+@keyframes liquidity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .summary-empty {
   padding: 24px 4px 7px;
   color: #70757d;
@@ -596,6 +708,8 @@ button {
 .execution-result strong {
   color: #f0c744;
   font-size: 14px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .execution-result p {
@@ -752,12 +866,14 @@ button {
   }
 
   .quote-grid,
-  .two-column {
+  .two-column,
+  .hooks-grid {
     grid-template-columns: 1fr;
   }
 
   .quote-grid .liquidity-field + .liquidity-field,
-  .two-column .liquidity-field + .liquidity-field {
+  .two-column .liquidity-field + .liquidity-field,
+  .hooks-grid .liquidity-field + .liquidity-field {
     margin-top: 0;
   }
 
