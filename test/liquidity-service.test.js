@@ -22,6 +22,8 @@ import {
   optimizedStableSwapAmount,
   poolIdOf,
   priceToSqrtPriceX96,
+  reusableAllowanceActions,
+  reusablePermit2ApprovalRequired,
   resolveLiquidityRangeTicks,
   sqrtPriceAtTick,
   stableBudgetAllocation,
@@ -457,6 +459,19 @@ test('token approvals are reduced to the exact operation amount', () => {
   assert.deepEqual(exactAllowanceActions(0n, 10n), ['approve']);
   assert.deepEqual(exactAllowanceActions(20n, 10n), ['reset', 'approve']);
   assert.deepEqual(exactAllowanceActions(10n, 0n), ['reset']);
+});
+
+test('reusable Permit2 approvals skip transactions while existing limits remain sufficient', () => {
+  assert.deepEqual(reusableAllowanceActions(20n, 10n), []);
+  assert.deepEqual(reusableAllowanceActions(10n, 10n), []);
+  assert.deepEqual(reusableAllowanceActions(0n, 10n), ['approve']);
+  assert.deepEqual(reusableAllowanceActions(5n, 10n), ['reset', 'approve']);
+  assert.deepEqual(reusableAllowanceActions(10n, 0n), []);
+
+  assert.equal(reusablePermit2ApprovalRequired(20n, 10n, 2_000, 1_000), false);
+  assert.equal(reusablePermit2ApprovalRequired(5n, 10n, 2_000, 1_000), true);
+  assert.equal(reusablePermit2ApprovalRequired(20n, 10n, 999, 1_000), true);
+  assert.equal(reusablePermit2ApprovalRequired(0n, 0n, 0, 1_000), false);
 });
 
 test('changing the stablecoin creates a different v4 PoolKey identity', () => {

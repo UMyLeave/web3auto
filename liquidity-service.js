@@ -557,6 +557,27 @@ export function exactAllowanceActions(currentAllowance, requiredAllowance) {
   return current > 0n ? ['reset', ...(required > 0n ? ['approve'] : [])] : ['approve'];
 }
 
+export function reusableAllowanceActions(currentAllowance, requiredAllowance) {
+  const current = BigInt(currentAllowance);
+  const required = BigInt(requiredAllowance);
+  if (current < 0n || required < 0n) throw new Error('授权金额不能为负数');
+  if (required === 0n || current >= required) return [];
+  return current > 0n ? ['reset', 'approve'] : ['approve'];
+}
+
+export function reusablePermit2ApprovalRequired(
+  currentAllowance,
+  requiredAllowance,
+  expiration,
+  minimumExpiration
+) {
+  const current = BigInt(currentAllowance);
+  const required = BigInt(requiredAllowance);
+  if (current < 0n || required < 0n) throw new Error('授权金额不能为负数');
+  if (required === 0n) return false;
+  return current < required || Number(expiration) < Number(minimumExpiration);
+}
+
 async function strictTokenMetadata(provider, token) {
   const address = ethers.getAddress(token);
   const code = await provider.getCode(address);
@@ -808,15 +829,19 @@ async function buildPlan(
     };
     const expiryFloor = Math.floor(Date.now() / 1000) + 300;
     approvals = {
-      token0ToPermit2: amount0Max > 0n && erc20Allowance0 !== amount0Max,
-      token1ToPermit2: amount1Max > 0n && erc20Allowance1 !== amount1Max,
-      permit2Token0ToManager: amount0Max > 0n && (
-        BigInt(permitAllowance0.amount) !== amount0Max
-        || Number(permitAllowance0.expiration) < expiryFloor
+      token0ToPermit2: amount0Max > 0n && erc20Allowance0 < amount0Max,
+      token1ToPermit2: amount1Max > 0n && erc20Allowance1 < amount1Max,
+      permit2Token0ToManager: reusablePermit2ApprovalRequired(
+        permitAllowance0.amount,
+        amount0Max,
+        permitAllowance0.expiration,
+        expiryFloor
       ),
-      permit2Token1ToManager: amount1Max > 0n && (
-        BigInt(permitAllowance1.amount) !== amount1Max
-        || Number(permitAllowance1.expiration) < expiryFloor
+      permit2Token1ToManager: reusablePermit2ApprovalRequired(
+        permitAllowance1.amount,
+        amount1Max,
+        permitAllowance1.expiration,
+        expiryFloor
       )
     };
   }
@@ -1226,7 +1251,7 @@ async function ensureApprovals(provider, wallet, config, plan, action, persist) 
     if (currency.amount === 0n) continue;
     const token = new ethers.Contract(currency.address, ERC20_ABI, provider);
     let allowance = await token.allowance(wallet.address, permit2);
-    const erc20Actions = exactAllowanceActions(allowance, currency.amount);
+    const erc20Actions = reusableAllowanceActions(allowance, currency.amount);
     if (erc20Actions.includes('reset')) {
       const zeroData = ERC20_INTERFACE.encodeFunctionData('approve', [permit2, 0n]);
       const receipt = await sendTransaction(provider, wallet, config, {
@@ -1242,7 +1267,7 @@ async function ensureApprovals(provider, wallet, config, plan, action, persist) 
       await persist(action);
     }
     if (erc20Actions.includes('approve')) {
-      const approvalData = ERC20_INTERFACE.encodeFunctionData('approve', [permit2, currency.amount]);
+      const approvalData = ERC20_INTERFACE.encodeFunctionData('approve', [permit2, ethers.MaxUint256]);
       const receipt = await sendTransaction(provider, wallet, config, {
         to: currency.address,
         data: approvalData,
@@ -1256,8 +1281,8 @@ async function ensureApprovals(provider, wallet, config, plan, action, persist) 
       await persist(action);
     }
     allowance = await token.allowance(wallet.address, permit2);
-    if (allowance !== currency.amount) {
-      throw new Error(`Permit2 的 ERC20 授权结果与本次仓位金额不一致：${currency.address}`);
+    if (allowance < currency.amount) {
+      throw new Error(`Permit2 的 ERC20 可用授权不足：${currency.address}`);
     }
 
     const permit2Contract = new ethers.Contract(permit2, PERMIT2_ABI, provider);
@@ -1266,12 +1291,17 @@ async function ensureApprovals(provider, wallet, config, plan, action, persist) 
       currency.address,
       plan.positionManagerAddress
     );
-    if (BigInt(permitAllowance.amount) !== currency.amount
-      || Number(permitAllowance.expiration) < expiry - 300) {
+    const minimumExpiration = Math.floor(Date.now() / 1000) + 300;
+    if (reusablePermit2ApprovalRequired(
+      permitAllowance.amount,
+      currency.amount,
+      permitAllowance.expiration,
+      minimumExpiration
+    )) {
       const permitData = PERMIT2_INTERFACE.encodeFunctionData('approve', [
         currency.address,
         plan.positionManagerAddress,
-        currency.amount,
+        UINT160_MASK,
         expiry
       ]);
       const receipt = await sendTransaction(provider, wallet, config, {
@@ -1296,9 +1326,13 @@ async function ensureApprovals(provider, wallet, config, plan, action, persist) 
       currency.address,
       plan.positionManagerAddress
     );
-    if (BigInt(verifiedPermitAllowance.amount) !== currency.amount
-      || Number(verifiedPermitAllowance.expiration) < expiry - 300) {
-      throw new Error(`Permit2 仓位授权结果与本次仓位金额不一致：${currency.address}`);
+    if (reusablePermit2ApprovalRequired(
+      verifiedPermitAllowance.amount,
+      currency.amount,
+      verifiedPermitAllowance.expiration,
+      minimumExpiration
+    )) {
+      throw new Error(`Permit2 仓位可用授权不足：${currency.address}`);
     }
   }
 }

@@ -3,9 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>BSC v4 初始化流动性</title>
+  <title>BSC v4 流动性管理</title>
   <link rel="stylesheet" href="/liquidity.css">
+  <link rel="stylesheet" href="/liquidity-management.css">
   <link rel="stylesheet" href="/modules/sidebar.css">
+  <link rel="stylesheet" href="/liquidity-theme.css">
 </head>
 <body data-page="liquidity">
   <div id="liquidityToast" class="liquidity-toast" role="status" aria-live="polite"></div>
@@ -17,11 +19,24 @@
           <svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/></svg>
         </span>
         <div>
-          <h1>初始化流动性</h1>
-          <p>创建新的 Uniswap v4 池，可选择是否添加初始流动性</p>
+          <h1>流动性管理</h1>
+          <p>创建新池，或管理当前钱包已有的 Uniswap v4 仓位</p>
         </div>
       </div>
-      <div id="walletState" class="wallet-state">读取执行环境</div>
+      <div class="liquidity-page-actions">
+        <div id="walletState" class="wallet-state">读取执行环境</div>
+        <button id="liquidityThemeToggle" class="liquidity-theme-toggle" type="button"
+          aria-label="切换页面主题" title="切换页面主题">
+          <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"/>
+          </svg>
+          <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"/>
+          </svg>
+          <span class="theme-tooltip" role="tooltip">切换页面主题</span>
+        </button>
+      </div>
     </header>
 
     <section class="wallet-balance-panel" aria-label="执行钱包余额">
@@ -37,7 +52,18 @@
       </div>
     </section>
 
-    <div class="liquidity-layout">
+    <nav class="liquidity-workspace-tabs" aria-label="流动性功能">
+      <button class="liquidity-workspace-tab active" type="button" data-liquidity-tab="create"
+        aria-controls="liquidityCreatePanel" aria-selected="true">
+        创建新池
+      </button>
+      <button class="liquidity-workspace-tab" type="button" data-liquidity-tab="manage"
+        aria-controls="liquidityManagePanel" aria-selected="false">
+        管理已有仓位
+      </button>
+    </nav>
+
+    <div id="liquidityCreatePanel" class="liquidity-layout" data-liquidity-panel="create">
       <form id="liquidityForm" class="liquidity-card liquidity-form-card">
         <section class="form-section">
           <div class="section-label">
@@ -221,9 +247,13 @@
         </section>
       </aside>
     </div>
+
+    <section id="liquidityManagePanel" data-liquidity-panel="manage" hidden></section>
   </main>
 
   <script type="module" src="/modules/sidebar.js"></script>
+  <script type="module" src="/liquidity-theme.js"></script>
   <script type="module" src="/liquidity.js"></script>
+  <script type="module" src="/liquidity-management.js"></script>
 </body>
 </html>

@@ -50,6 +50,6 @@
   "maxGasLimit": 3000000,
   "maxStableBudget": 1000,
   "maxFeePercent": 10,
-  "permit2ExpirationSeconds": 3600,
+  "permit2ExpirationSeconds": 2592000,
   "transactionDeadlineSeconds": 180
 }

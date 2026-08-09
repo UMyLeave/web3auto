@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 import { createLiquidityRouter } from './liquidity-service.js';
+import { createLiquidityManagementRouter } from './liquidity-management-service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
@@ -13,6 +14,7 @@ const ACTION_PATH = path.join(__dirname, '.guard-action.json');
 const ACTION_TMP_PATH = path.join(__dirname, '.guard-action.json.tmp');
 const LIQUIDITY_CONFIG_PATH = path.join(__dirname, 'liquidity-config.json');
 const LIQUIDITY_ACTION_PATH = path.join(__dirname, '.liquidity-action.json');
+const LIQUIDITY_MANAGEMENT_ACTION_PATH = path.join(__dirname, '.liquidity-management-action.json');
 
 const V4_POSITION_MANAGER = '0x7A4a5c919aE2541AeD11041A1AEeE68f1287f95b';
 const POSITION_ABI = [
@@ -105,6 +107,7 @@ function waitForReceiptWake(sequence, timeoutMs) {
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+let liquidityManagementRouter = null;
 const liquidityRouter = createLiquidityRouter({
   configPath: LIQUIDITY_CONFIG_PATH,
   actionPath: LIQUIDITY_ACTION_PATH,
@@ -115,10 +118,30 @@ const liquidityRouter = createLiquidityRouter({
     if (state.lastAction?.stage === 'needs_attention') {
       return '撤退后的兑换任务仍待处理，请先完成原流程';
     }
+    if (liquidityManagementRouter?.hasBlockingAction()) {
+      return '仓位管理任务正在执行或仍待处理，请先完成恢复';
+    }
     return null;
   }
 });
 app.use('/api/liquidity', liquidityRouter);
+liquidityManagementRouter = createLiquidityManagementRouter({
+  configPath: LIQUIDITY_CONFIG_PATH,
+  actionPath: LIQUIDITY_MANAGEMENT_ACTION_PATH,
+  executionConflict: () => {
+    if (state.running || state.inFlight || state.arming) {
+      return '仓位监控或撤退/兑换流程正在运行，请先停止并等待链上操作结束';
+    }
+    if (state.lastAction?.stage === 'needs_attention') {
+      return '撤退后的兑换任务仍待处理，请先完成原流程';
+    }
+    if (liquidityRouter.isExecutionInFlight()) {
+      return '初始化流动性任务正在执行，请等待完成';
+    }
+    return null;
+  }
+});
+app.use('/api/liquidity-management', liquidityManagementRouter);
 app.get(['/monitor', '/monitor/'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -2675,6 +2698,7 @@ app.get('/api/config', async (_req, res) => {
 app.post('/api/config', async (req, res) => {
   try {
     if (state.running || state.inFlight) throw new Error('监控运行或交易执行期间不能修改配置，请先停止');
+    if (liquidityManagementRouter.hasBlockingAction()) throw new Error('仓位管理任务正在执行或仍待处理，不能修改配置');
     if (state.lastAction?.stage === 'needs_attention') throw new Error('存在待处理的撤出后兑换任务，请先点击“重试兑换”或手工处理');
     const config = await readConfig();
     const slippagePercent = Number(req.body.slippagePercent);
@@ -2744,6 +2768,7 @@ app.post('/api/start', async (_req, res) => {
   try {
     if (process.env.AUTO_EXECUTE !== 'true') throw new Error('AUTO_EXECUTE=false。请在 .env 中明确开启自动交易。');
     if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
+    if (liquidityManagementRouter.hasBlockingAction()) throw new Error('仓位管理任务正在执行或仍待处理，请先完成恢复');
     if (state.inFlight) throw new Error('已有链上操作正在执行');
     if (state.lastAction?.stage === 'needs_attention') throw new Error('存在待处理的撤出后兑换任务，请先重试兑换或手工处理');
     if (!state.running) {
@@ -2805,6 +2830,7 @@ app.post('/api/retry-swaps', async (_req, res) => {
   try {
     if (state.running) throw new Error('请先停止监控再重试兑换');
     if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
+    if (liquidityManagementRouter.hasBlockingAction()) throw new Error('仓位管理任务正在执行或仍待处理，请先完成恢复');
     if (state.inFlight) throw new Error('已有链上操作正在执行');
     state.inFlight = true;
     operationLockAcquired = true;
@@ -2822,6 +2848,7 @@ app.post('/api/retry-swaps', async (_req, res) => {
 app.post('/api/resolve-manual', async (_req, res) => {
   try {
     if (liquidityRouter.isExecutionInFlight()) throw new Error('初始化流动性任务正在执行，请等待完成');
+    if (liquidityManagementRouter.hasBlockingAction()) throw new Error('仓位管理任务正在执行或仍待处理，请先完成恢复');
     if (state.running || state.inFlight) throw new Error('请先停止监控，且等待当前链上操作结束');
     const action = state.lastAction;
     if (!action || action.stage !== 'needs_attention' || !action.withdrawTxHash) {
