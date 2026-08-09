@@ -23,6 +23,8 @@ const MAX_UINT128 = (1n << 128n) - 1n;
 const MIN_TICK = -887272;
 const MAX_TICK = 887272;
 const MAX_TICK_SPACING = 32767;
+const EXECUTION_MODE_INITIALIZE_ONLY = 'initialize_only';
+const EXECUTION_MODE_INITIALIZE_AND_ADD = 'initialize_and_add';
 const ERC721_TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
 
 const POSITION_ABI = [
@@ -446,11 +448,19 @@ export function normalizeLiquidityInput(body, config) {
     .find((entry) => entry.address.toLowerCase() === quoteToken.toLowerCase());
   if (!stablecoin) throw new Error('计价代币必须来自流动性模块的稳定币白名单');
 
+  const executionMode = String(body.executionMode || EXECUTION_MODE_INITIALIZE_AND_ADD);
+  if (![EXECUTION_MODE_INITIALIZE_ONLY, EXECUTION_MODE_INITIALIZE_AND_ADD].includes(executionMode)) {
+    throw new Error('无法识别初始化执行模式');
+  }
+  const addsLiquidity = executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
   const price = decimalFraction(body.price, '代币价格');
-  const budget = decimalFraction(body.budget, '投入稳定币');
-  const maximumBudget = decimalFraction(config.maxStableBudget ?? 1000, '稳定币投入安全上限');
-  if (budget.numerator * maximumBudget.denominator > maximumBudget.numerator * budget.denominator) {
-    throw new Error(`稳定币投入超过安全上限 ${config.maxStableBudget ?? 1000} ${stablecoin.symbol}`);
+  let budget = null;
+  if (addsLiquidity) {
+    budget = decimalFraction(body.budget, '投入稳定币');
+    const maximumBudget = decimalFraction(config.maxStableBudget ?? 1000, '稳定币投入安全上限');
+    if (budget.numerator * maximumBudget.denominator > maximumBudget.numerator * budget.denominator) {
+      throw new Error(`稳定币投入超过安全上限 ${config.maxStableBudget ?? 1000} ${stablecoin.symbol}`);
+    }
   }
 
   const feeFraction = decimalFraction(body.feePercent, 'V4 费率');
@@ -468,8 +478,10 @@ export function normalizeLiquidityInput(body, config) {
     throw new Error(`Tick Spacing 必须是 1 到 ${MAX_TICK_SPACING} 的整数`);
   }
 
-  const rangeType = String(body.rangeType || 'percent');
-  if (!['percent', 'full', 'custom'].includes(rangeType)) throw new Error('无法识别初始化区间');
+  const rangeType = addsLiquidity ? String(body.rangeType || 'percent') : null;
+  if (addsLiquidity && !['percent', 'full', 'custom'].includes(rangeType)) {
+    throw new Error('无法识别初始化区间');
+  }
   let lowerPrice = null;
   let upperPrice = null;
   if (rangeType === 'custom') {
@@ -485,15 +497,16 @@ export function normalizeLiquidityInput(body, config) {
     tradeToken,
     quoteToken,
     quoteSymbol: stablecoin.symbol,
+    executionMode,
     price: price.text,
-    budget: budget.text,
+    budget: budget?.text || null,
     fee,
     feePercent: fee / 10_000,
     tickSpacing,
     hooks,
     acknowledgeCustomHooks: body.acknowledgeCustomHooks === true,
     rangeType,
-    rangePercent: rangeType === 'percent' ? String(body.rangePercent || '90') : null,
+    rangePercent: addsLiquidity && rangeType === 'percent' ? String(body.rangePercent || '90') : null,
     lowerPrice,
     upperPrice
   };
@@ -503,13 +516,14 @@ export function liquidityExecutionFingerprint(input) {
   const payload = {
     tradeToken: ethers.getAddress(input.tradeToken).toLowerCase(),
     quoteToken: ethers.getAddress(input.quoteToken).toLowerCase(),
+    executionMode: String(input.executionMode || EXECUTION_MODE_INITIALIZE_AND_ADD),
     price: String(input.price),
-    budget: String(input.budget),
+    budget: input.budget === null ? null : String(input.budget),
     fee: Number(input.fee),
     tickSpacing: Number(input.tickSpacing),
     hooks: ethers.getAddress(input.hooks).toLowerCase(),
     acknowledgeCustomHooks: input.acknowledgeCustomHooks === true,
-    rangeType: String(input.rangeType),
+    rangeType: input.rangeType === null ? null : String(input.rangeType),
     rangePercent: input.rangePercent === null ? null : String(input.rangePercent),
     lowerPrice: input.lowerPrice === null ? null : String(input.lowerPrice),
     upperPrice: input.upperPrice === null ? null : String(input.upperPrice)
@@ -645,7 +659,8 @@ export function assertExecutionPlanInvariant(plan, authorization, requireInitial
   if (plan.requestedSqrtPriceX96.toString() !== authorization.requestedSqrtPriceX96) {
     throw new Error('执行期间初始价格与预检结果不一致，已停止执行');
   }
-  if (plan.tickLower !== authorization.tickLower || plan.tickUpper !== authorization.tickUpper) {
+  if (plan.input?.executionMode !== EXECUTION_MODE_INITIALIZE_ONLY
+    && (plan.tickLower !== authorization.tickLower || plan.tickUpper !== authorization.tickUpper)) {
     throw new Error('执行期间流动性区间与预检结果不一致，已停止执行');
   }
   if (requireInitialized && !plan.pool.initialized) {
@@ -664,14 +679,15 @@ async function buildPlan(
   fixedTicks = null
 ) {
   const input = normalizeLiquidityInput(body, config);
+  const addsLiquidity = input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
   const positionManagerAddress = ethers.getAddress(config.positionManager);
   const positionManager = new ethers.Contract(positionManagerAddress, POSITION_ABI, provider);
   const [trade, quote, poolManagerAddress, permit2Address, nextTokenId] = await Promise.all([
     strictTokenMetadata(provider, input.tradeToken),
     strictTokenMetadata(provider, input.quoteToken),
     positionManager.poolManager(),
-    positionManager.permit2(),
-    positionManager.nextTokenId()
+    addsLiquidity ? positionManager.permit2() : Promise.resolve(null),
+    addsLiquidity ? positionManager.nextTokenId() : Promise.resolve(null)
   ]);
   if (input.hooks !== ZERO) {
     const hookCode = await provider.getCode(input.hooks);
@@ -713,50 +729,61 @@ async function buildPlan(
   const activePrice = currentPool.initialized
     ? sqrtPriceToHumanPrice(activeSqrtPriceX96, trade.decimals, quote.decimals, tradeIsCurrency0)
     : input.price;
-  const { tickLower, tickUpper } = resolveLiquidityRangeTicks(
-    input,
-    currentTick,
-    tradeIsCurrency0,
-    trade.decimals,
-    quote.decimals,
-    fixedTicks
-  );
-  const allocation = stableBudgetAllocation(
-    input.budget,
-    activePrice,
-    trade.decimals,
-    quote.decimals,
-    tradeIsCurrency0,
-    activeSqrtPriceX96,
-    tickLower,
-    tickUpper
-  );
-  const amount0Max = fixedAmountCaps
-    ? BigInt(fixedAmountCaps.amount0Max)
-    : (tradeIsCurrency0 ? allocation.tradeAmount : allocation.quoteAmount);
-  const amount1Max = fixedAmountCaps
-    ? BigInt(fixedAmountCaps.amount1Max)
-    : (tradeIsCurrency0 ? allocation.quoteAmount : allocation.tradeAmount);
-  if (amount0Max < 0n || amount1Max < 0n || (amount0Max === 0n && amount1Max === 0n)) {
-    throw new Error('自动分配后的仓位投入必须大于 0');
+  let tickLower = null;
+  let tickUpper = null;
+  let allocation = null;
+  let amount0Max = 0n;
+  let amount1Max = 0n;
+  let liquidity = 0n;
+  let estimatedAmounts = { amount0: 0n, amount1: 0n };
+  if (addsLiquidity) {
+    ({ tickLower, tickUpper } = resolveLiquidityRangeTicks(
+      input,
+      currentTick,
+      tradeIsCurrency0,
+      trade.decimals,
+      quote.decimals,
+      fixedTicks
+    ));
+    allocation = stableBudgetAllocation(
+      input.budget,
+      activePrice,
+      trade.decimals,
+      quote.decimals,
+      tradeIsCurrency0,
+      activeSqrtPriceX96,
+      tickLower,
+      tickUpper
+    );
+    amount0Max = fixedAmountCaps
+      ? BigInt(fixedAmountCaps.amount0Max)
+      : (tradeIsCurrency0 ? allocation.tradeAmount : allocation.quoteAmount);
+    amount1Max = fixedAmountCaps
+      ? BigInt(fixedAmountCaps.amount1Max)
+      : (tradeIsCurrency0 ? allocation.quoteAmount : allocation.tradeAmount);
+    if (amount0Max < 0n || amount1Max < 0n || (amount0Max === 0n && amount1Max === 0n)) {
+      throw new Error('自动分配后的仓位投入必须大于 0');
+    }
+    if (amount0Max > MAX_UINT128 || amount1Max > MAX_UINT128) {
+      throw new Error('初始化金额超过 uint128 上限');
+    }
+    liquidity = liquidityForAmounts(
+      amount0Max,
+      amount1Max,
+      activeSqrtPriceX96,
+      tickLower,
+      tickUpper
+    );
+    if (liquidity > MAX_UINT128) throw new Error('计算出的流动性超过 uint128 上限');
+    estimatedAmounts = principalAmounts(liquidity, activeSqrtPriceX96, tickLower, tickUpper);
   }
-  if (amount0Max > MAX_UINT128 || amount1Max > MAX_UINT128) throw new Error('初始化金额超过 uint128 上限');
-  const liquidity = liquidityForAmounts(
-    amount0Max,
-    amount1Max,
-    activeSqrtPriceX96,
-    tickLower,
-    tickUpper
-  );
-  if (liquidity > MAX_UINT128) throw new Error('计算出的流动性超过 uint128 上限');
-  const estimatedAmounts = principalAmounts(liquidity, activeSqrtPriceX96, tickLower, tickUpper);
 
   const token0 = poolKey.currency0.toLowerCase() === trade.address.toLowerCase() ? trade : quote;
   const token1 = poolKey.currency1.toLowerCase() === trade.address.toLowerCase() ? trade : quote;
-  const permit2 = ethers.getAddress(permit2Address);
+  const permit2 = permit2Address ? ethers.getAddress(permit2Address) : null;
   let wallet = null;
   let approvals = null;
-  if (owner) {
+  if (owner && addsLiquidity) {
     const token0Contract = new ethers.Contract(poolKey.currency0, ERC20_ABI, provider);
     const token1Contract = new ethers.Contract(poolKey.currency1, ERC20_ABI, provider);
     const permit2Contract = new ethers.Contract(permit2, PERMIT2_ABI, provider);
@@ -794,10 +821,11 @@ async function buildPlan(
     };
   }
 
-  const deadline = Math.floor(Date.now() / 1000)
-    + Math.max(60, Number(config.transactionDeadlineSeconds) || 180);
+  const deadline = addsLiquidity
+    ? Math.floor(Date.now() / 1000) + Math.max(60, Number(config.transactionDeadlineSeconds) || 180)
+    : null;
   const initializeCalldata = encodeInitializePool(poolKey, requestedSqrtPriceX96);
-  const calldata = owner ? encodeLiquidityTransaction({
+  const calldata = owner && addsLiquidity ? encodeLiquidityTransaction({
     poolKey,
     tickLower,
     tickUpper,
@@ -820,7 +848,9 @@ async function buildPlan(
     }
   }
   let estimatedGas = null;
-  const approvalsReady = approvals && !Object.values(approvals).some(Boolean);
+  const approvalsReady = addsLiquidity
+    ? Boolean(approvals && !Object.values(approvals).some(Boolean))
+    : true;
   if (estimateGas && currentPool.initialized && approvalsReady && calldata) {
     try {
       estimatedGas = await provider.estimateGas({
@@ -857,7 +887,7 @@ async function buildPlan(
     amount1Max,
     amount0Estimated: estimatedAmounts.amount0,
     amount1Estimated: estimatedAmounts.amount1,
-    stableInputAmount: allocation.stableBudget,
+    stableInputAmount: allocation?.stableBudget || 0n,
     allocation,
     liquidity,
     nextTokenId,
@@ -969,14 +999,17 @@ function publicPlan(plan, config, autoAllocation = null) {
     requestedPrice: plan.input.price,
     activePrice: plan.activePrice,
     quoteSymbol: plan.input.quoteSymbol,
+    executionMode: plan.input.executionMode,
     budget: plan.input.budget,
     feePercent: plan.input.feePercent,
     poolKey: plan.poolKey,
     currentTick: plan.currentTick,
     tickLower: plan.tickLower,
     tickUpper: plan.tickUpper,
-    liquidity: plan.liquidity.toString(),
-    nextTokenId: plan.nextTokenId.toString(),
+    liquidity: plan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD
+      ? plan.liquidity.toString()
+      : null,
+    nextTokenId: plan.nextTokenId?.toString() || null,
     tradeToken: plan.trade,
     quoteToken: plan.quote,
     token0: {
@@ -1072,9 +1105,65 @@ function transactionEntry(kind, token, hash, receipt = null) {
     kind,
     token,
     hash,
+    status: receipt ? (Number(receipt.status) === 1 ? 'confirmed' : 'failed') : 'pending',
     blockNumber: receipt?.blockNumber ?? null,
     confirmedAt: receipt ? new Date().toISOString() : null
   };
+}
+
+export function actionIsInitializeOnly(action) {
+  return action?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
+    || action?.request?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
+    || action?.plan?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY;
+}
+
+export function applyInitializationReceiptReconciliation(
+  action,
+  receipt,
+  checkedAt = new Date().toISOString()
+) {
+  const hash = receipt?.hash || action.currentTx?.hash || action.poolInitializeTxHash || null;
+  action.initializationReconciliation = {
+    checkedAt,
+    hash,
+    confirmed: Boolean(receipt),
+    succeeded: receipt ? Number(receipt.status) === 1 : null
+  };
+  if (!receipt) {
+    action.stage = 'needs_attention';
+    action.error = '池子初始化交易已广播，但暂未读取到链上回执，请稍后重新核对';
+    return false;
+  }
+
+  const existingIndex = action.transactions?.findIndex((entry) => (
+    entry.kind === 'initialize_pool' && entry.hash === hash
+  )) ?? -1;
+  const entry = {
+    kind: 'initialize_pool',
+    token: null,
+    hash,
+    status: Number(receipt.status) === 1 ? 'confirmed' : 'failed',
+    blockNumber: receipt.blockNumber ?? null,
+    confirmedAt: checkedAt
+  };
+  action.transactions ||= [];
+  if (existingIndex >= 0) action.transactions[existingIndex] = entry;
+  else action.transactions.push(entry);
+  action.currentTx = null;
+
+  if (Number(receipt.status) !== 1) {
+    action.stage = 'failed';
+    action.error = `池子初始化交易链上执行失败：${hash}`;
+    action.failedAt = checkedAt;
+    return true;
+  }
+
+  action.poolInitializeTxHash = hash;
+  action.poolInitializedAt ||= checkedAt;
+  action.stage = 'completed';
+  action.error = null;
+  action.completedAt ||= checkedAt;
+  return true;
 }
 
 async function ensureTokenAllowance(
@@ -1357,6 +1446,7 @@ export function actionMayHaveMintedPosition(action) {
 
 function actionPlanSummary(plan) {
   return {
+    executionMode: plan.input.executionMode,
     poolId: plan.pool.poolId,
     poolKey: plan.poolKey,
     poolWasInitialized: plan.pool.initialized,
@@ -1406,6 +1496,7 @@ function describeLiquidityExecutionError(error) {
 
 function contextualLiquidityExecutionError(error, action = null) {
   const described = describeLiquidityExecutionError(error);
+  if (actionIsInitializeOnly(action)) return described;
   const initializationConfirmed = action?.transactions?.some(
     (entry) => entry.kind === 'initialize_pool'
       && entry.hash === action.poolInitializeTxHash
@@ -1460,11 +1551,37 @@ export function createLiquidityRouter({
       const uncertainTransaction = Boolean(
         lastAction.currentTx?.hash
         || (lastAction.stage === 'needs_attention' && lastAction.liquidityTxHash)
+        || (lastAction.stage === 'needs_attention'
+          && actionIsInitializeOnly(lastAction)
+          && lastAction.poolInitializeTxHash)
       );
       if (uncertainTransaction) {
         lastAction.stage = 'needs_attention';
         lastAction.error ||= '服务曾在加池流程中断，请先核对已广播交易';
         await writeJsonAtomic(actionPath, lastAction);
+        if (actionIsInitializeOnly(lastAction)) {
+          let reconciliationProvider;
+          try {
+            const config = await readJson(configPath);
+            reconciliationProvider = await openProvider(config);
+            const hash = lastAction.currentTx?.hash || lastAction.poolInitializeTxHash;
+            const receipt = await reconciliationProvider.getTransactionReceipt(hash);
+            applyInitializationReceiptReconciliation(lastAction, receipt);
+            await writeJsonAtomic(actionPath, lastAction);
+          } catch (reconciliationError) {
+            lastAction.initializationReconciliation = {
+              checkedAt: new Date().toISOString(),
+              hash: lastAction.currentTx?.hash || lastAction.poolInitializeTxHash || null,
+              confirmed: false,
+              succeeded: null,
+              error: reconciliationError.message
+            };
+            await writeJsonAtomic(actionPath, lastAction);
+          } finally {
+            reconciliationProvider?.destroy();
+          }
+          return;
+        }
         if (!actionMayHaveMintedPosition(lastAction)) {
           applyActionPositionReconciliation(lastAction, [], {
             errorMessage: lastAction.error,
@@ -1631,22 +1748,21 @@ export function createLiquidityRouter({
         }
       }
       const basePlan = await buildPlan(provider, config, req.body, owner, false);
-      const autoAllocation = await buildAutoAllocationQuote(
-        provider,
-        config,
-        environment,
-        basePlan,
-        owner
-      );
+      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
+      const autoAllocation = addsLiquidity
+        ? await buildAutoAllocationQuote(provider, config, environment, basePlan, owner)
+        : null;
       const plan = await buildPlan(
         provider,
         config,
         req.body,
         owner,
         true,
-        autoAllocation.amountCaps,
+        autoAllocation?.amountCaps || null,
         false,
-        { tickLower: basePlan.tickLower, tickUpper: basePlan.tickUpper }
+        addsLiquidity
+          ? { tickLower: basePlan.tickLower, tickUpper: basePlan.tickUpper }
+          : null
       );
       prunePreviewAuthorizations();
       const previewId = crypto.randomUUID();
@@ -1688,7 +1804,7 @@ export function createLiquidityRouter({
     let pendingSwapApproval = null;
     try {
       await ready;
-      if (req.body.confirmed !== true) throw new Error('必须先确认本次稳定币投入、自动兑换和风险提示');
+      if (req.body.confirmed !== true) throw new Error('必须先确认本次建池执行及风险提示');
       if (environment.LIQUIDITY_EXECUTE !== 'true') {
         throw new Error('LIQUIDITY_EXECUTE=false，请在 .env 中单独开启加池交易');
       }
@@ -1709,6 +1825,7 @@ export function createLiquidityRouter({
       }
       provider = await openProvider(config);
       const basePlan = await buildPlan(provider, config, req.body, wallet.address, false);
+      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
       prunePreviewAuthorizations();
       const previewAuthorization = previewAuthorizations.get(String(req.body.previewId || ''));
       assertLiquidityPreviewAuthorization(previewAuthorization, {
@@ -1717,32 +1834,28 @@ export function createLiquidityRouter({
         owner: wallet.address
       });
       assertExecutionPlanInvariant(basePlan, previewAuthorization);
-      const lockedTicks = {
+      const lockedTicks = addsLiquidity ? {
         tickLower: previewAuthorization.tickLower,
         tickUpper: previewAuthorization.tickUpper
-      };
+      } : null;
       if (basePlan.input.hooks !== ZERO && !basePlan.input.acknowledgeCustomHooks) {
         throw new Error('使用自定义 Hooks 前必须勾选风险确认');
       }
-      if (!basePlan.wallet.stableInputSufficient) {
+      if (addsLiquidity && !basePlan.wallet.stableInputSufficient) {
         throw new Error(
           `钱包 ${basePlan.quote.symbol} 余额不足，无法投入 ${basePlan.input.budget} ${basePlan.quote.symbol}`
         );
       }
-      const autoAllocation = await buildAutoAllocationQuote(
-        provider,
-        config,
-        environment,
-        basePlan,
-        wallet.address
-      );
+      const autoAllocation = addsLiquidity
+        ? await buildAutoAllocationQuote(provider, config, environment, basePlan, wallet.address)
+        : null;
       const quotedPlan = await buildPlan(
         provider,
         config,
         req.body,
         wallet.address,
         true,
-        autoAllocation.amountCaps,
+        autoAllocation?.amountCaps || null,
         false,
         lockedTicks
       );
@@ -1756,10 +1869,12 @@ export function createLiquidityRouter({
         startedAt: new Date().toISOString(),
         startedBlockNumber,
         wallet: wallet.address,
+        executionMode: basePlan.input.executionMode,
         poolId: quotedPlan.pool.poolId,
         request: {
           tradeToken: basePlan.input.tradeToken,
           quoteToken: basePlan.input.quoteToken,
+          executionMode: basePlan.input.executionMode,
           price: basePlan.input.price,
           budget: basePlan.input.budget,
           feePercent: basePlan.input.feePercent,
@@ -1772,7 +1887,7 @@ export function createLiquidityRouter({
           acknowledgeCustomHooks: basePlan.input.acknowledgeCustomHooks
         },
         plan: actionPlanSummary(quotedPlan),
-        autoSwap: {
+        autoSwap: autoAllocation ? {
           status: autoAllocation.required ? 'planned' : 'not_required',
           quoteToken: basePlan.quote.address,
           quoteSymbol: basePlan.quote.symbol,
@@ -1786,7 +1901,7 @@ export function createLiquidityRouter({
           ),
           spender: autoAllocation.spender,
           hash: null
-        },
+        } : null,
         transactions: [],
         currentTx: null,
         error: null
@@ -1810,6 +1925,13 @@ export function createLiquidityRouter({
       ));
       action.currentTx = null;
       action.poolInitializedAt = new Date().toISOString();
+      if (!addsLiquidity) {
+        action.stage = 'completed';
+        action.completedAt = new Date().toISOString();
+        await persist(action);
+        res.json(action);
+        return;
+      }
       action.stage = 'preparing_swap';
       await persist(action);
 
@@ -2017,6 +2139,38 @@ export function createLiquidityRouter({
     } catch (rawError) {
       let error = contextualLiquidityExecutionError(rawError, action);
       if (action) {
+        if (actionIsInitializeOnly(action)) {
+          const confirmedInitialization = action.transactions?.find((entry) => (
+            entry.kind === 'initialize_pool'
+            && entry.blockNumber !== null
+            && entry.blockNumber !== undefined
+          ));
+          if (confirmedInitialization) {
+            applyInitializationReceiptReconciliation(action, {
+              hash: confirmedInitialization.hash,
+              blockNumber: confirmedInitialization.blockNumber,
+              status: 1
+            });
+          } else if (action.currentTx?.hash && provider) {
+            try {
+              const receipt = await provider.getTransactionReceipt(action.currentTx.hash);
+              applyInitializationReceiptReconciliation(action, receipt);
+            } catch (reconciliationError) {
+              action.stage = 'needs_attention';
+              action.error = `${error.message}；暂时无法核对池子初始化交易：${reconciliationError.message}`;
+            }
+          } else {
+            action.stage = 'failed';
+            action.error = error.message;
+            action.failedAt = new Date().toISOString();
+          }
+          await persist(action);
+          if (action.stage === 'completed') return res.json(action);
+          return res.status(action.stage === 'needs_attention' ? 409 : 400).json({
+            error: action.error,
+            action
+          });
+        }
         if (rawError.transactionConfirmedFailed && action.currentTx) {
           action.transactions.push({
             ...action.currentTx,
@@ -2072,11 +2226,23 @@ export function createLiquidityRouter({
     let provider;
     try {
       await ready;
-      if (req.body.confirmed !== true) throw new Error('必须确认核对仓位并处理待确认任务');
+      if (req.body.confirmed !== true) throw new Error('必须确认核对链上交易并处理待确认任务');
       if (inFlight) throw new Error('加池任务执行中，不能结束记录');
       if (lastAction?.stage !== 'needs_attention') throw new Error('当前没有待处理任务');
       inFlight = true;
       const config = await readJson(configPath);
+      if (actionIsInitializeOnly(lastAction)) {
+        provider = await openProvider(config);
+        const hash = lastAction.currentTx?.hash || lastAction.poolInitializeTxHash;
+        if (!hash) throw new Error('待核对任务缺少池子初始化交易哈希');
+        const receipt = await provider.getTransactionReceipt(hash);
+        const settled = applyInitializationReceiptReconciliation(lastAction, receipt);
+        await persist(lastAction);
+        if (!settled) {
+          return res.status(409).json({ error: lastAction.error, action: lastAction });
+        }
+        return res.json(lastAction);
+      }
       let positions = [];
       if (actionMayHaveMintedPosition(lastAction)) {
         provider = await openProvider(config);

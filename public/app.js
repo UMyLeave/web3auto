@@ -401,12 +401,28 @@ function displayPositionAmount(amount) {
   return `${compactDecimal(amount.formatted, 6)} ${amount.symbol}`;
 }
 
+function displayPositionValue(value) {
+  if (!value) return '暂无法估算';
+  const formatted = compactDecimal(value.formatted, 2);
+  if (formatted === '0') {
+    try {
+      if (BigInt(value.raw) > 0n) return '≈ < 0.01 U';
+    } catch {
+      // Fall through to the formatted value when the API value is non-standard.
+    }
+  }
+  return `≈ ${formatted} U`;
+}
+
 function renderPosition(label, tokenId, position, kind) {
   const amounts = position.amounts || [];
   const amountRows = amounts.map((amount) =>
     `<div class="asset-amount ${amount.isStablecoin ? 'stable' : ''}"><dt>${amount.isStablecoin ? '稳定币' : '代币'} · ${escapeHtml(amount.symbol)}</dt><dd>${escapeHtml(displayPositionAmount(amount))}</dd></div>`
   ).join('');
-  return `<article class="position-card ${escapeHtml(kind)}"><div class="position-card-head"><span>${escapeHtml(label)}</span><strong>#${escapeHtml(tokenId)}</strong></div><dl>${amountRows}<div><dt>流动性</dt><dd>${escapeHtml(position.liquidity)}</dd></div><div><dt>持有人</dt><dd title="${escapeHtml(position.owner)}">${escapeHtml(shortAddress(position.owner))}</dd></div><div><dt>价格区间 Tick</dt><dd>${escapeHtml(position.tickLower)} ～ ${escapeHtml(position.tickUpper)}</dd></div><div><dt>费率 / Tick 间距</dt><dd>${escapeHtml(position.poolKey.fee)} / ${escapeHtml(position.poolKey.tickSpacing)}</dd></div></dl></article>`;
+  const valueTitle = position.valueInStablecoin
+    ? `按当前池内现价折算为 ${position.valueInStablecoin.symbol}`
+    : '当前池子未识别到唯一的白名单稳定币';
+  return `<article class="position-card ${escapeHtml(kind)}"><div class="position-card-head"><span>${escapeHtml(label)}</span><strong>#${escapeHtml(tokenId)}</strong></div><dl>${amountRows}<div class="position-total" title="${escapeHtml(valueTitle)}"><dt>仓位总计</dt><dd>${escapeHtml(displayPositionValue(position.valueInStablecoin))}</dd></div><div><dt>流动性</dt><dd>${escapeHtml(position.liquidity)}</dd></div><div><dt>持有人</dt><dd title="${escapeHtml(position.owner)}">${escapeHtml(shortAddress(position.owner))}</dd></div><div><dt>价格区间 Tick</dt><dd>${escapeHtml(position.tickLower)} ～ ${escapeHtml(position.tickUpper)}</dd></div><div><dt>费率 / Tick 间距</dt><dd>${escapeHtml(position.poolKey.fee)} / ${escapeHtml(position.poolKey.tickSpacing)}</dd></div></dl></article>`;
 }
 
 function aggregateTargetAmounts(targets) {

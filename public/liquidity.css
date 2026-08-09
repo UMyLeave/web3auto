@@ -214,6 +214,10 @@ button {
   border-bottom: 1px solid var(--line);
 }
 
+.form-section[hidden] {
+  display: none;
+}
+
 .section-label,
 .summary-heading {
   display: flex;
@@ -317,6 +321,14 @@ button {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
+}
+
+.budget-choices {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.budget-choices .choice {
+  font-size: 12px;
 }
 
 .choice {

@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ethers } from 'ethers';
 import {
+  actionIsInitializeOnly,
   actionMayHaveMintedPosition,
+  applyInitializationReceiptReconciliation,
   applyActionPositionReconciliation,
   assertExecutionPlanInvariant,
   assertLiquidityPreviewAuthorization,
@@ -377,6 +379,34 @@ test('execution requires a fresh preview for the exact normalized request and wa
   }), /过期/);
 });
 
+test('preview fingerprint separates initialize-only from initialize-and-add modes', () => {
+  const input = {
+    tradeToken: TRADE,
+    quoteToken: QUOTE,
+    executionMode: 'initialize_only',
+    price: '1',
+    budget: null,
+    fee: 3000,
+    tickSpacing: 60,
+    hooks: ethers.ZeroAddress,
+    acknowledgeCustomHooks: false,
+    rangeType: null,
+    rangePercent: null,
+    lowerPrice: null,
+    upperPrice: null
+  };
+  assert.notEqual(
+    liquidityExecutionFingerprint(input),
+    liquidityExecutionFingerprint({
+      ...input,
+      executionMode: 'initialize_and_add',
+      budget: '10',
+      rangeType: 'percent',
+      rangePercent: '90'
+    })
+  );
+});
+
 test('execution keeps previewed ticks fixed and stops when price leaves the locked range', () => {
   const input = {
     rangeType: 'percent',
@@ -517,6 +547,81 @@ test('liquidity input enforces quote whitelist and stable-input safety cap', () 
     feePercent: '0.3',
     tickSpacing: '60'
   }, config), /白名单/);
+});
+
+test('initialize-only input does not require a budget or liquidity range', () => {
+  const normalized = normalizeLiquidityInput({
+    tradeToken: TRADE,
+    quoteToken: QUOTE,
+    executionMode: 'initialize_only',
+    price: '1',
+    feePercent: '0.3',
+    tickSpacing: '60',
+    hooks: ethers.ZeroAddress
+  }, config);
+  assert.equal(normalized.executionMode, 'initialize_only');
+  assert.equal(normalized.budget, null);
+  assert.equal(normalized.rangeType, null);
+  assert.equal(normalized.rangePercent, null);
+  assert.equal(normalized.lowerPrice, null);
+  assert.equal(normalized.upperPrice, null);
+});
+
+test('initialize-only receipt reconciliation completes without an NFT', () => {
+  const hash = `0x${'ab'.repeat(32)}`;
+  const action = {
+    executionMode: 'initialize_only',
+    stage: 'needs_attention',
+    poolInitializeTxHash: hash,
+    currentTx: { kind: 'initialize_pool', hash },
+    transactions: []
+  };
+  assert.equal(actionIsInitializeOnly(action), true);
+  assert.equal(applyInitializationReceiptReconciliation(action, {
+    hash,
+    blockNumber: 123,
+    status: 1
+  }, '2026-08-02T00:00:00.000Z'), true);
+  assert.equal(action.stage, 'completed');
+  assert.equal(action.currentTx, null);
+  assert.equal(action.nftId, undefined);
+  assert.equal(action.transactions[0].kind, 'initialize_pool');
+  assert.equal(action.transactions[0].blockNumber, 123);
+});
+
+test('initialize-only receipt reconciliation keeps an unconfirmed transaction blocked', () => {
+  const hash = `0x${'cd'.repeat(32)}`;
+  const action = {
+    request: { executionMode: 'initialize_only' },
+    stage: 'initializing',
+    currentTx: { kind: 'initialize_pool', hash },
+    transactions: []
+  };
+  assert.equal(applyInitializationReceiptReconciliation(action, null), false);
+  assert.equal(action.stage, 'needs_attention');
+  assert.equal(action.currentTx.hash, hash);
+  assert.match(action.error, /暂未读取到链上回执/);
+});
+
+test('initialize-only failed receipt remains failed instead of looking initialized', () => {
+  const hash = `0x${'ef'.repeat(32)}`;
+  const action = {
+    executionMode: 'initialize_only',
+    stage: 'needs_attention',
+    poolInitializeTxHash: hash,
+    currentTx: { kind: 'initialize_pool', hash, status: 'pending' },
+    transactions: []
+  };
+  assert.equal(applyInitializationReceiptReconciliation(action, {
+    hash,
+    blockNumber: 456,
+    status: 0
+  }, '2026-08-02T00:01:00.000Z'), true);
+  assert.equal(action.stage, 'failed');
+  assert.equal(action.currentTx, null);
+  assert.equal(action.poolInitializedAt, undefined);
+  assert.equal(action.transactions[0].status, 'failed');
+  assert.equal(action.initializationReconciliation.succeeded, false);
 });
 
 test('mint payload uses MINT_POSITION followed by SETTLE_PAIR', () => {

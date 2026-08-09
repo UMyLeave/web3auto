@@ -1,4 +1,6 @@
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const EXECUTION_MODE_INITIALIZE_ONLY = 'initialize_only';
+const EXECUTION_MODE_INITIALIZE_AND_ADD = 'initialize_and_add';
 
 const elements = {
   form: document.querySelector('#liquidityForm'),
@@ -12,6 +14,7 @@ const elements = {
   customBudgetField: document.querySelector('#customBudgetField'),
   customBudget: document.querySelector('#customBudget'),
   budgetUnit: document.querySelector('#budgetUnit'),
+  rangeSection: document.querySelector('#rangeSection'),
   customRangeFields: document.querySelector('#customRangeFields'),
   lowerPrice: document.querySelector('#lowerPrice'),
   upperPrice: document.querySelector('#upperPrice'),
@@ -25,6 +28,7 @@ const elements = {
   previewState: document.querySelector('#previewState'),
   poolStageState: document.querySelector('#poolStageState'),
   positionStageState: document.querySelector('#positionStageState'),
+  positionBlockTitle: document.querySelector('#positionBlockTitle'),
   poolResult: document.querySelector('#poolResult'),
   positionResult: document.querySelector('#positionResult'),
   actionControls: document.querySelector('#actionControls'),
@@ -39,7 +43,7 @@ const elements = {
 
 let options = null;
 let lastPreview = null;
-let selectedBudget = '10';
+let selectedBudget = 'none';
 let selectedRange = { type: 'percent', percent: '90' };
 let toastTimer = null;
 let statusTimer = null;
@@ -48,6 +52,7 @@ let balancePollVersion = 0;
 let blockingAction = false;
 let executionRequestPending = false;
 let executionStartedAtMs = 0;
+let displayedAction = null;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -134,10 +139,29 @@ function renderHookPresets() {
   syncHooksPresetFromAddress();
 }
 
+function addsLiquidity() {
+  return selectedBudget !== 'none';
+}
+
+function actionInitializeOnly(action) {
+  return action?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
+    || action?.request?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
+    || action?.plan?.executionMode === EXECUTION_MODE_INITIALIZE_ONLY;
+}
+
 function refreshConditionalFields() {
   elements.customBudgetField.classList.toggle('visible', selectedBudget === 'custom');
-  elements.customRangeFields.classList.toggle('visible', selectedRange.type === 'custom');
+  elements.rangeSection.hidden = !addsLiquidity();
+  elements.customRangeFields.classList.toggle(
+    'visible',
+    addsLiquidity() && selectedRange.type === 'custom'
+  );
   elements.hooksAcknowledge.classList.toggle('visible', customHooksEnabled());
+  if (!executionRequestPending) {
+    elements.executeButton.textContent = addsLiquidity()
+      ? '确认并执行加池'
+      : '确认并创建池子';
+  }
 }
 
 function invalidatePreview() {
@@ -148,17 +172,27 @@ function invalidatePreview() {
 }
 
 function collectPayload() {
+  const withPosition = addsLiquidity();
   return {
     tradeToken: elements.tradeToken.value.trim(),
     quoteToken: elements.quoteToken.value,
     price: elements.price.value.trim(),
     feePercent: elements.feePercent.value.trim(),
     tickSpacing: elements.tickSpacing.value.trim(),
-    budget: selectedBudget === 'custom' ? elements.customBudget.value.trim() : selectedBudget,
-    rangeType: selectedRange.type,
-    rangePercent: selectedRange.percent || null,
-    lowerPrice: selectedRange.type === 'custom' ? elements.lowerPrice.value.trim() : null,
-    upperPrice: selectedRange.type === 'custom' ? elements.upperPrice.value.trim() : null,
+    executionMode: withPosition
+      ? EXECUTION_MODE_INITIALIZE_AND_ADD
+      : EXECUTION_MODE_INITIALIZE_ONLY,
+    budget: withPosition
+      ? (selectedBudget === 'custom' ? elements.customBudget.value.trim() : selectedBudget)
+      : null,
+    rangeType: withPosition ? selectedRange.type : null,
+    rangePercent: withPosition ? (selectedRange.percent || null) : null,
+    lowerPrice: withPosition && selectedRange.type === 'custom'
+      ? elements.lowerPrice.value.trim()
+      : null,
+    upperPrice: withPosition && selectedRange.type === 'custom'
+      ? elements.upperPrice.value.trim()
+      : null,
     hooks: elements.hooks.value.trim() || ZERO_ADDRESS,
     acknowledgeCustomHooks: elements.acknowledgeCustomHooks.checked
   };
@@ -202,6 +236,7 @@ function poolInitializationConfirmed(action) {
     action?.poolInitializedAt
     || action?.transactions?.some((transaction) => (
       transaction.kind === 'initialize_pool'
+      && transaction.status !== 'failed'
       && transaction.blockNumber !== null
       && transaction.blockNumber !== undefined
     ))
@@ -233,9 +268,10 @@ function stageProgress(action) {
 
 function renderPreview(plan) {
   const sourceLabel = '输入的初始价格';
-  const walletReady = plan.wallet?.stableInputSufficient;
+  const withPosition = plan.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
+  const walletReady = !withPosition || plan.wallet?.stableInputSufficient;
   const canExecute = plan.privateKeyConfigured
-    && plan.autoAllocationConfigured
+    && (!withPosition || plan.autoAllocationConfigured)
     && plan.executionEnabled
     && walletReady
     && !blockingAction
@@ -259,8 +295,9 @@ function renderPreview(plan) {
     ${plan.hooksWarning ? `<div class="preview-warning">${escapeHtml(plan.hooksWarning)}</div>` : ''}
   `;
 
+  elements.positionBlockTitle.textContent = withPosition ? '兑换与仓位' : '仓位处理';
   elements.positionResult.className = 'preview-stack';
-  elements.positionResult.innerHTML = `
+  elements.positionResult.innerHTML = withPosition ? `
     <dl class="preview-list">
       <div><dt>投入稳定币</dt><dd>${escapeHtml(plan.stableInputAmount)} ${escapeHtml(plan.quoteSymbol)}</dd></div>
       <div><dt>Tick 区间</dt><dd>${escapeHtml(plan.tickLower)} ～ ${escapeHtml(plan.tickUpper)}</dd></div>
@@ -297,17 +334,30 @@ function renderPreview(plan) {
     ` : ''}
     ${!plan.autoAllocationConfigured ? '<div class="preview-warning">未配置 OKX DEX API 凭证，无法完成稳定币自动分配。</div>' : ''}
     ${!plan.executionEnabled ? '<div class="preview-warning">只读预检可用；执行前需在 .env 中设置 LIQUIDITY_EXECUTE=true 并重启服务。</div>' : ''}
+  ` : `
+    <div class="pool-state">
+      <span>执行模式</span>
+      <strong>仅初始化池子</strong>
+    </div>
+    <dl class="preview-list">
+      <div><dt>投入稳定币</dt><dd>不投入</dd></div>
+      <div><dt>流动性区间</dt><dd>本次不需要</dd></div>
+      <div><dt>自动兑换</dt><dd>不执行</dd></div>
+      <div><dt>仓位 NFT</dt><dd>不创建</dd></div>
+    </dl>
+    <div class="preview-warning">该 PoolKey 初始化后不能再次创建；本次完成后池内仍没有流动性。</div>
+    ${!plan.executionEnabled ? '<div class="preview-warning">只读预检可用；执行前需在 .env 中设置 LIQUIDITY_EXECUTE=true 并重启服务。</div>' : ''}
   `;
   setStageBadge(elements.previewState, '预检完成', 'ready');
   setStageBadge(elements.poolStageState, '预检通过', 'ready');
-  setStageBadge(elements.positionStageState, '仓位预览', 'ready');
+  setStageBadge(elements.positionStageState, withPosition ? '仓位预览' : '本次跳过', 'ready');
   elements.executeButton.disabled = !canExecute;
 
   if (!plan.privateKeyConfigured) {
     elements.formMessage.textContent = '未配置 PRIVATE_KEY，当前只能预检。';
-  } else if (!plan.autoAllocationConfigured) {
+  } else if (withPosition && !plan.autoAllocationConfigured) {
     elements.formMessage.textContent = '未配置 OKX DEX API 凭证，不能执行自动分配。';
-  } else if (!walletReady) {
+  } else if (withPosition && !walletReady) {
     elements.formMessage.textContent = `钱包 ${plan.quoteToken.symbol} 余额不足，不能执行。`;
   } else if (!plan.executionEnabled) {
     elements.formMessage.textContent = '执行开关未开启，当前只能预检。';
@@ -329,17 +379,20 @@ function renderPreviewError(error) {
   elements.poolResult.className = 'preview-error';
   elements.poolResult.textContent = error.message;
   elements.positionResult.className = 'summary-empty';
-  elements.positionResult.textContent = '预检未通过，不会执行兑换和添加仓位。';
+  elements.positionResult.textContent = addsLiquidity()
+    ? '预检未通过，不会执行兑换和添加仓位。'
+    : '预检未通过，不会发送池子初始化交易。';
   elements.actionControls.hidden = true;
   elements.formMessage.textContent = error.message;
 }
 
 function renderExecutionStarting(plan) {
+  const withPosition = plan.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
   resetRenderKey(elements.poolResult);
   resetRenderKey(elements.positionResult);
   setStageBadge(elements.previewState, '执行中', 'loading');
   setStageBadge(elements.poolStageState, '创建中', 'loading');
-  setStageBadge(elements.positionStageState, '等待池子', 'loading');
+  setStageBadge(elements.positionStageState, withPosition ? '等待池子' : '本次跳过', withPosition ? 'loading' : 'ready');
   elements.poolResult.className = 'preview-stack';
   elements.poolResult.innerHTML = `
     ${loadingMarkup('正在创建池子', '池子确认后会立即在这里显示 Pool ID')}
@@ -348,15 +401,16 @@ function renderExecutionStarting(plan) {
       <div><dt>交易对</dt><dd>${escapeHtml(plan.token0.symbol)} / ${escapeHtml(plan.token1.symbol)}</dd></div>
     </dl>
   `;
+  elements.positionBlockTitle.textContent = withPosition ? '兑换与仓位' : '仓位处理';
   elements.positionResult.className = 'preview-stack';
-  elements.positionResult.innerHTML = loadingMarkup(
-    '等待池子创建完成',
-    '之后将依次显示兑换、授权和添加仓位进度'
-  );
+  elements.positionResult.innerHTML = withPosition
+    ? loadingMarkup('等待池子创建完成', '之后将依次显示兑换、授权和添加仓位进度')
+    : '<div class="summary-empty">本次只创建池子，不会执行兑换、授权或添加仓位。</div>';
   elements.actionControls.hidden = true;
 }
 
 function renderStoredAction(action, inFlight = false) {
+  displayedAction = action || null;
   if (!action) {
     blockingAction = false;
     elements.actionControls.hidden = true;
@@ -366,6 +420,7 @@ function renderStoredAction(action, inFlight = false) {
   const attention = action.stage === 'needs_attention';
   const failed = action.stage === 'failed';
   const cancelled = action.stage === 'cancelled';
+  const initializeOnly = actionInitializeOnly(action);
   const terminal = completed || attention || failed || cancelled;
   const running = inFlight || !terminal;
   const poolConfirmed = poolInitializationConfirmed(action);
@@ -410,7 +465,11 @@ function renderStoredAction(action, inFlight = false) {
         <p>建池交易：${escapeHtml(action.poolInitializeTxHash || '—')}</p>
       `;
     } else if (failed || attention || cancelled) {
-      setStageBadge(elements.poolStageState, '未创建', failed || attention ? 'error' : '');
+      setStageBadge(
+        elements.poolStageState,
+        attention ? '待核对' : '未创建',
+        failed || attention ? 'error' : ''
+      );
       elements.poolResult.className = failed || attention ? 'preview-error' : 'execution-result';
       elements.poolResult.innerHTML = `
         <p>Pool ID：${escapeHtml(actionPoolId(action) || '—')}</p>
@@ -434,6 +493,7 @@ function renderStoredAction(action, inFlight = false) {
 
   const positionRenderKey = JSON.stringify([
     actionIdentity,
+    initializeOnly,
     action.stage,
     poolConfirmed,
     confirmedTransactions,
@@ -447,8 +507,18 @@ function renderStoredAction(action, inFlight = false) {
     action.error,
     action.resolution
   ]);
+  elements.positionBlockTitle.textContent = initializeOnly ? '仓位处理' : '兑换与仓位';
   if (elements.positionResult.dataset.renderKey !== positionRenderKey) {
-    if (completed) {
+    if (initializeOnly) {
+      setStageBadge(elements.positionStageState, '本次跳过', 'ready');
+      elements.positionResult.className = 'execution-result';
+      elements.positionResult.innerHTML = `
+        <strong>未添加流动性仓位</strong>
+        <p>本次模式仅初始化池子，没有投入稳定币。</p>
+        <p>未执行自动兑换、代币授权或 NFT 仓位创建。</p>
+        <p>已确认 ${escapeHtml(confirmedTransactions)} 笔链上交易。</p>
+      `;
+    } else if (completed) {
       setStageBadge(elements.positionStageState, '已完成', 'ready');
       elements.positionResult.className = 'execution-result';
       elements.positionResult.innerHTML = `
@@ -507,18 +577,23 @@ function renderStoredAction(action, inFlight = false) {
   const canResolve = attention;
   elements.actionControls.hidden = !canResolve || inFlight;
   elements.resolveActionButton.disabled = inFlight;
+  elements.resolveActionButton.textContent = initializeOnly ? '核对建池交易' : '核对仓位并放行';
   if (running) {
     elements.executeButton.disabled = true;
-    elements.formMessage.textContent = '已有加池任务正在执行，请等待链上结果。';
+    elements.formMessage.textContent = initializeOnly
+      ? '已有池子初始化任务正在执行，请等待链上结果。'
+      : '已有加池任务正在执行，请等待链上结果。';
   }
 }
 
 async function resolveStoredAction() {
-  if (!window.confirm(
-    '系统会先只读查询本次目标 Pool ID 的 NFT 仓位。'
-    + '\n找到仓位会记录 NFT ID；没有仓位会保留钱包资产和已有授权，并解除新任务阻塞。'
-    + '\n\n不会续跑、补发或撤销交易。是否继续？'
-  )) return;
+  const initializeOnly = actionInitializeOnly(displayedAction);
+  const prompt = initializeOnly
+    ? '系统会只读查询本次池子初始化交易的链上回执。\n\n不会续跑、补发或撤销交易。是否继续？'
+    : '系统会先只读查询本次目标 Pool ID 的 NFT 仓位。'
+      + '\n找到仓位会记录 NFT ID；没有仓位会保留钱包资产和已有授权，并解除新任务阻塞。'
+      + '\n\n不会续跑、补发或撤销交易。是否继续？';
+  if (!window.confirm(prompt)) return;
   elements.resolveActionButton.disabled = true;
   try {
     const action = await request('/api/liquidity/resolve', {
@@ -528,11 +603,19 @@ async function resolveStoredAction() {
     renderStoredAction(action, false);
     lastPreview = null;
     elements.executeButton.disabled = true;
-    elements.formMessage.textContent = action.nftId
-      ? `已检测到目标池 NFT #${action.nftId}，待确认状态已解除。`
-      : '未检测到目标池 NFT，待确认状态已解除，可发起新任务。';
-    showToast(action.nftId ? `已识别 NFT #${action.nftId}` : '未发现仓位，已安全放行');
+    if (initializeOnly) {
+      elements.formMessage.textContent = action.stage === 'completed'
+        ? '已确认池子初始化交易成功。'
+        : '已确认池子初始化交易失败，可重新预检。';
+      showToast(action.stage === 'completed' ? '池子初始化已确认' : '建池交易已确认失败');
+    } else {
+      elements.formMessage.textContent = action.nftId
+        ? `已检测到目标池 NFT #${action.nftId}，待确认状态已解除。`
+        : '未检测到目标池 NFT，待确认状态已解除，可发起新任务。';
+      showToast(action.nftId ? `已识别 NFT #${action.nftId}` : '未发现仓位，已安全放行');
+    }
   } catch (error) {
+    if (error.data?.action) renderStoredAction(error.data.action, false);
     elements.formMessage.textContent = error.message;
     showToast(error.message, 'error');
   } finally {
@@ -587,6 +670,17 @@ async function preview(event) {
 
 function executeSummary() {
   if (!lastPreview) return '';
+  if (lastPreview.executionMode === EXECUTION_MODE_INITIALIZE_ONLY) {
+    return [
+      '执行模式：仅初始化池子',
+      `交易对：${lastPreview.token0.symbol} / ${lastPreview.token1.symbol}`,
+      `初始价格：${lastPreview.activePrice} ${lastPreview.quoteSymbol}`,
+      '投入稳定币：不投入',
+      '自动兑换、授权和仓位 NFT：均不执行',
+      '',
+      '该 PoolKey 初始化后不能再次创建，且本次完成后池内仍没有流动性。确认发送建池交易吗？'
+    ].join('\n');
+  }
   const allocation = lastPreview.autoAllocation;
   return [
     '池状态：新池，先独立初始化成功再执行兑换与加仓',
@@ -625,19 +719,23 @@ async function executeLiquidity() {
     });
     renderStoredAction(action, false);
     elements.formMessage.textContent = '';
-    showToast('初始化流动性执行完成');
+    showToast(executionPreview.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
+      ? '池子初始化完成'
+      : '初始化流动性执行完成');
     lastPreview = null;
   } catch (error) {
     if (error.data?.action) renderStoredAction(error.data.action, false);
     elements.formMessage.textContent = error.message;
-    setStageBadge(elements.previewState, '执行失败', 'error');
+    if (!error.data?.action) setStageBadge(elements.previewState, '执行失败', 'error');
     showToast(error.message, 'error');
   } finally {
     executionRequestPending = false;
     executionStartedAtMs = 0;
     clearTimeout(statusTimer);
     statusTimer = setTimeout(pollStatus, 0);
-    elements.executeButton.textContent = '确认并执行加池';
+    elements.executeButton.textContent = addsLiquidity()
+      ? '确认并执行加池'
+      : '确认并创建池子';
     elements.previewButton.disabled = false;
   }
 }
@@ -649,6 +747,7 @@ function bindChoices() {
       button.classList.add('active');
       selectedBudget = button.dataset.budget;
       refreshConditionalFields();
+      refreshWalletState();
       invalidatePreview();
     });
   });
@@ -769,6 +868,27 @@ function restartBalancePolling(delay = 0) {
   balanceTimer = setTimeout(() => pollWalletBalances(version), delay);
 }
 
+function refreshWalletState() {
+  if (!options) return;
+  if (!options.privateKeyConfigured) {
+    elements.walletState.className = 'wallet-state blocked';
+    elements.walletState.textContent = '未配置 PRIVATE_KEY · 仅预检';
+  } else if (addsLiquidity() && !options.autoAllocationConfigured) {
+    elements.walletState.className = 'wallet-state blocked';
+    elements.walletState.textContent = `${options.walletAddress} · 自动分配未配置`;
+  } else if (!options.executionEnabled) {
+    elements.walletState.className = 'wallet-state';
+    elements.walletState.textContent = `${options.walletAddress} · 执行未开启`;
+  } else {
+    elements.walletState.className = 'wallet-state ready';
+    elements.walletState.textContent = `${options.walletAddress} · ${addsLiquidity() ? '可执行' : '可初始化池子'}`;
+  }
+  if (options.inFlight) {
+    elements.walletState.className = 'wallet-state';
+    elements.walletState.textContent = `${options.walletAddress || '服务端钱包'} · 建池执行中`;
+  }
+}
+
 async function loadOptions() {
   try {
     options = await request('/api/liquidity/options');
@@ -777,24 +897,7 @@ async function loadOptions() {
     )).join('');
     renderHookPresets();
     refreshQuote();
-
-    if (!options.privateKeyConfigured) {
-      elements.walletState.className = 'wallet-state blocked';
-      elements.walletState.textContent = '未配置 PRIVATE_KEY · 仅预检';
-    } else if (!options.autoAllocationConfigured) {
-      elements.walletState.className = 'wallet-state blocked';
-      elements.walletState.textContent = `${options.walletAddress} · 自动分配未配置`;
-    } else if (!options.executionEnabled) {
-      elements.walletState.className = 'wallet-state';
-      elements.walletState.textContent = `${options.walletAddress} · 执行未开启`;
-    } else {
-      elements.walletState.className = 'wallet-state ready';
-      elements.walletState.textContent = `${options.walletAddress} · 可执行`;
-    }
-    if (options.inFlight) {
-      elements.walletState.className = 'wallet-state';
-      elements.walletState.textContent = `${options.walletAddress || '服务端钱包'} · 加池执行中`;
-    }
+    refreshWalletState();
     renderStoredAction(options.lastAction, options.inFlight);
     if (options.inFlight) statusTimer = setTimeout(pollStatus, 1000);
     restartBalancePolling();

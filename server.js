@@ -39,6 +39,7 @@ const OKX_NATIVE = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const OKX_API_BASE = 'https://web3.okx.com';
 const CHAIN_ID = 56n;
 const Q96 = 1n << 96n;
+const Q192 = 1n << 192n;
 const UINT24_MASK = 0xffffffn;
 const UINT160_MASK = (1n << 160n) - 1n;
 const MAX_UINT256 = (1n << 256n) - 1n;
@@ -593,6 +594,18 @@ function principalAmounts(liquidity, sqrtPriceX96, tickLower, tickUpper) {
   };
 }
 
+function positionValueInStablecoin(amount0, amount1, sqrtPriceX96, stablecoinIndex) {
+  const sqrtPrice = BigInt(sqrtPriceX96);
+  if (sqrtPrice <= 0n) return null;
+  if (stablecoinIndex === 0) {
+    return BigInt(amount0) + BigInt(amount1) * Q192 / (sqrtPrice * sqrtPrice);
+  }
+  if (stablecoinIndex === 1) {
+    return BigInt(amount1) + BigInt(amount0) * sqrtPrice * sqrtPrice / Q192;
+  }
+  return null;
+}
+
 const tokenMetadataCache = new Map();
 
 async function tokenMetadata(provider, token, blockTag = 'latest') {
@@ -642,6 +655,18 @@ async function enrichedPosition(provider, position, blockTag, config) {
   const { tickLower, tickUpper } = positionTicks(position.info);
   const { amount0, amount1 } = principalAmounts(position.liquidity, sqrtPriceX96, tickLower, tickUpper);
   const stableAddresses = new Set(configuredStablecoins(config).map((item) => item.address.toLowerCase()));
+  const token0IsStablecoin = stableAddresses.has(token0.address.toLowerCase());
+  const token1IsStablecoin = stableAddresses.has(token1.address.toLowerCase());
+  const stablecoinIndex = token0IsStablecoin === token1IsStablecoin
+    ? null
+    : token0IsStablecoin ? 0 : 1;
+  const stablecoinToken = stablecoinIndex === 0 ? token0 : stablecoinIndex === 1 ? token1 : null;
+  const totalValueRaw = positionValueInStablecoin(
+    amount0,
+    amount1,
+    sqrtPriceX96,
+    stablecoinIndex
+  );
   return {
     ...publicPosition(position),
     currentTick,
@@ -654,15 +679,21 @@ async function enrichedPosition(provider, position, blockTag, config) {
         ...token0,
         raw: amount0.toString(),
         formatted: ethers.formatUnits(amount0, token0.decimals),
-        isStablecoin: stableAddresses.has(token0.address.toLowerCase())
+        isStablecoin: token0IsStablecoin
       },
       {
         ...token1,
         raw: amount1.toString(),
         formatted: ethers.formatUnits(amount1, token1.decimals),
-        isStablecoin: stableAddresses.has(token1.address.toLowerCase())
+        isStablecoin: token1IsStablecoin
       }
-    ]
+    ],
+    valueInStablecoin: totalValueRaw === null ? null : {
+      ...stablecoinToken,
+      raw: totalValueRaw.toString(),
+      formatted: ethers.formatUnits(totalValueRaw, stablecoinToken.decimals),
+      priceSource: 'pool-spot'
+    }
   };
 }
 
@@ -2893,6 +2924,7 @@ export {
   prepareTransaction,
   preparedSwapMatches,
   principalAmounts,
+  positionValueInStablecoin,
   publishStreamBlock,
   shutdownBlockStream,
   sameTokenPair,

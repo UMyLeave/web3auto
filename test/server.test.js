@@ -17,6 +17,7 @@ import {
   normalizeTargetNftIds,
   poolFingerprint,
   positionTicks,
+  positionValueInStablecoin,
   prepareQuotedTransaction,
   prepareTransaction,
   preparedSwapMatches,
@@ -274,6 +275,13 @@ test('calculates the correct token side outside a position range', () => {
   assert.equal(below.amount1, 0n);
   assert.equal(above.amount0, 0n);
   assert.ok(above.amount1 > 0n);
+});
+
+test('values both position assets in the pool stablecoin at the current spot price', () => {
+  const sqrtPriceX96 = 2n * (1n << 96n); // 1 token0 raw unit = 4 token1 raw units.
+  assert.equal(positionValueInStablecoin(3n, 5n, sqrtPriceX96, 1), 17n);
+  assert.equal(positionValueInStablecoin(3n, 5n, sqrtPriceX96, 0), 4n);
+  assert.equal(positionValueInStablecoin(3n, 5n, sqrtPriceX96, null), null);
 });
 
 test('surfaces the underlying OKX connection failure code', () => {

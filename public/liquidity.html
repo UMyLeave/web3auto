@@ -18,7 +18,7 @@
         </span>
         <div>
           <h1>初始化流动性</h1>
-          <p>创建新的 Uniswap v4 池并添加初始流动性</p>
+          <p>创建新的 Uniswap v4 池，可选择是否添加初始流动性</p>
         </div>
       </div>
       <div id="walletState" class="wallet-state">读取执行环境</div>
@@ -93,13 +93,14 @@
         <section class="form-section">
           <div class="section-label">
             <span>投入稳定币</span>
-            <small>系统自动兑换所需部分，并按仓位区间分配</small>
+            <small>默认只创建池子；选择金额后才会自动兑换并添加仓位</small>
           </div>
           <div class="choice-grid budget-choices" role="group" aria-label="投入稳定币">
-            <button type="button" class="choice active" data-budget="10">10U</button>
+            <button type="button" class="choice" data-budget="10">10U</button>
             <button type="button" class="choice" data-budget="20">20U</button>
             <button type="button" class="choice" data-budget="50">50U</button>
             <button type="button" class="choice" data-budget="custom">自定义</button>
+            <button type="button" class="choice active" data-budget="none">不投入稳定币</button>
           </div>
           <label id="customBudgetField" class="liquidity-field conditional-field" for="customBudget">
             <span>自定义稳定币投入</span>
@@ -110,7 +111,7 @@
           </label>
         </section>
 
-        <section class="form-section">
+        <section id="rangeSection" class="form-section" hidden>
           <div class="section-label">
             <span>流动性区间</span>
             <small>百分比区间以新池初始价为中心</small>
@@ -160,7 +161,7 @@
 
         <div class="form-actions">
           <button id="previewButton" class="secondary-button" type="submit">只读预检</button>
-          <button id="executeButton" class="primary-button" type="button" disabled>确认并执行加池</button>
+          <button id="executeButton" class="primary-button" type="button" disabled>确认并创建池子</button>
         </div>
         <p id="formMessage" class="form-message" aria-live="polite"></p>
       </form>
@@ -194,10 +195,10 @@
                   <span class="execution-step">2</span>
                   <strong id="positionBlockTitle">兑换与仓位</strong>
                 </div>
-                <span id="positionStageState" class="summary-badge">等待池子</span>
+                <span id="positionStageState" class="summary-badge">本次跳过</span>
               </div>
               <div id="positionResult" class="summary-empty" aria-live="polite">
-                池子创建后显示兑换、授权和最终 NFT 仓位进度。
+                当前选择只初始化池子，不执行兑换、授权和添加仓位。
               </div>
             </section>
           </div>
@@ -213,7 +214,8 @@
           <ul>
             <li>使用独立流动性配置和执行记录</li>
             <li>与仓位监控、撤退及兑换任务互斥</li>
-            <li>先确认新池初始化成功，再兑换代币和创建仓位</li>
+            <li>不投入稳定币时只初始化池子，不执行兑换和创建仓位</li>
+            <li>选择投入金额时，先确认池子初始化成功，再兑换代币和创建仓位</li>
             <li>私钥仅由服务端从 .env 读取，前端只接收公开地址和余额</li>
           </ul>
         </section>

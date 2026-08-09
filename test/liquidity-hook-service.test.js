@@ -152,3 +152,18 @@ test('liquidity page accepts the full static v4 fee precision', async () => {
     /id="feePercent"[^>]*step="0\.0001"/
   );
 });
+
+test('liquidity page defaults to initialize-only and hides the range section', async () => {
+  const [html, browserModule] = await Promise.all([
+    fs.readFile(new URL('../public/liquidity.html', import.meta.url), 'utf8'),
+    fs.readFile(new URL('../public/liquidity.js', import.meta.url), 'utf8')
+  ]);
+  assert.match(
+    html,
+    /data-budget="custom">自定义<\/button>\s*<button[^>]*class="choice active"[^>]*data-budget="none">不投入稳定币<\/button>/
+  );
+  assert.match(html, /id="rangeSection"[^>]*hidden/);
+  assert.match(browserModule, /let selectedBudget = 'none'/);
+  assert.match(browserModule, /EXECUTION_MODE_INITIALIZE_ONLY/);
+  assert.match(browserModule, /transaction\.status !== 'failed'/);
+});
