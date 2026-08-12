@@ -1,6 +1,7 @@
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const EXECUTION_MODE_INITIALIZE_ONLY = 'initialize_only';
 const EXECUTION_MODE_INITIALIZE_AND_ADD = 'initialize_and_add';
+const CREATE_FORM_STORAGE_KEY = 'liquidity-create-form-v1';
 
 const elements = {
   form: document.querySelector('#liquidityForm'),
@@ -72,6 +73,7 @@ async function request(path, requestOptions = {}) {
   if (!response.ok) {
     const error = new Error(data.error || `请求失败 (${response.status})`);
     error.data = data;
+    error.status = response.status;
     throw error;
   }
   return data;
@@ -95,6 +97,102 @@ function refreshQuote() {
   elements.quoteAddress.value = quote?.address || '';
   elements.budgetUnit.textContent = quote?.symbol || 'U';
   elements.priceHint.textContent = `1 交易代币 = ${elements.price.value || '—'} ${quote?.symbol || '稳定币'}`;
+}
+
+function readStoredFormSnapshot() {
+  try {
+    const raw = window.sessionStorage.getItem(CREATE_FORM_STORAGE_KEY);
+    if (!raw) return null;
+    const snapshot = JSON.parse(raw);
+    return snapshot && typeof snapshot === 'object' ? snapshot : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistFormSnapshot() {
+  const snapshot = {
+    tradeToken: elements.tradeToken.value,
+    quoteToken: elements.quoteToken.value,
+    price: elements.price.value,
+    feePercent: elements.feePercent.value,
+    tickSpacing: elements.tickSpacing.value,
+    customBudget: elements.customBudget.value,
+    lowerPrice: elements.lowerPrice.value,
+    upperPrice: elements.upperPrice.value,
+    hooks: elements.hooks.value,
+    acknowledgeCustomHooks: elements.acknowledgeCustomHooks.checked,
+    selectedBudget,
+    selectedRange
+  };
+  try {
+    window.sessionStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Private browsing or a blocked storage policy should not interrupt form use.
+  }
+}
+
+function restoreFormSnapshot() {
+  const snapshot = readStoredFormSnapshot();
+  if (!snapshot) return false;
+
+  const setValue = (element, value) => {
+    if (typeof value === 'string' || typeof value === 'number') element.value = String(value);
+  };
+  setValue(elements.tradeToken, snapshot.tradeToken);
+  const storedQuote = options?.stablecoins?.find((item) => (
+    item.address?.toLowerCase() === String(snapshot.quoteToken || '').toLowerCase()
+  ));
+  if (storedQuote) {
+    elements.quoteToken.value = storedQuote.address;
+  }
+  setValue(elements.price, snapshot.price);
+  setValue(elements.feePercent, snapshot.feePercent);
+  setValue(elements.tickSpacing, snapshot.tickSpacing);
+  setValue(elements.customBudget, snapshot.customBudget);
+  setValue(elements.lowerPrice, snapshot.lowerPrice);
+  setValue(elements.upperPrice, snapshot.upperPrice);
+  setValue(elements.hooks, snapshot.hooks || ZERO_ADDRESS);
+  elements.acknowledgeCustomHooks.checked = Boolean(snapshot.acknowledgeCustomHooks);
+
+  const budget = String(snapshot.selectedBudget || 'none');
+  selectedBudget = ['none', '10', '20', '50', 'custom'].includes(budget) ? budget : 'none';
+  document.querySelectorAll('[data-budget]').forEach((button) => {
+    button.classList.toggle('active', button.dataset.budget === selectedBudget);
+  });
+
+  const range = snapshot.selectedRange && typeof snapshot.selectedRange === 'object'
+    ? snapshot.selectedRange
+    : {};
+  const rangeType = ['percent', 'full', 'custom'].includes(range.type) ? range.type : 'percent';
+  selectedRange = {
+    type: rangeType,
+    percent: rangeType === 'percent' ? (range.percent || '90') : null
+  };
+  let matchingRange = [...document.querySelectorAll('[data-range]')].find((button) => (
+    button.dataset.range === selectedRange.type
+      && (selectedRange.type !== 'percent' || button.dataset.percent === String(selectedRange.percent))
+  ));
+  if (!matchingRange) {
+    matchingRange = [...document.querySelectorAll('[data-range]')].find((button) => (
+      button.dataset.range === 'percent' && button.dataset.percent === '90'
+    ));
+    selectedRange = {
+      type: matchingRange?.dataset.range || 'percent',
+      percent: matchingRange?.dataset.percent || '90'
+    };
+  }
+  if (matchingRange) {
+    selectedRange.percent = matchingRange.dataset.percent || null;
+  }
+  document.querySelectorAll('[data-range]').forEach((button) => {
+    button.classList.toggle('active', button === matchingRange);
+  });
+
+  syncHooksPresetFromAddress();
+  refreshConditionalFields();
+  refreshQuote();
+  return true;
 }
 
 function customHooksEnabled() {
@@ -260,6 +358,7 @@ function stageProgress(action) {
     preparing_swap: ['正在准备兑换', '池子已创建，正在重新校验价格和兑换参数'],
     swapping: ['正在兑换代币', '稳定币兑换交易正在准备或等待链上确认'],
     preparing_liquidity: ['正在计算仓位', '兑换已确认，正在按实际到账数量重新计算仓位'],
+    resuming: ['正在恢复加仓', '正在复用上次已兑换的钱包资产，不会再次建池或兑换'],
     approving: ['正在处理授权', '正在完成 ERC20 与 Permit2 授权'],
     submitting: ['正在添加仓位', '仓位交易已发送或正在等待链上确认']
   };
@@ -267,9 +366,12 @@ function stageProgress(action) {
 }
 
 function renderPreview(plan) {
-  const sourceLabel = '输入的初始价格';
+  const recovery = Boolean(plan.recoveryMode);
+  const sourceLabel = recovery ? '已初始化池的链上价格' : '输入的初始价格';
   const withPosition = plan.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
-  const walletReady = !withPosition || plan.wallet?.stableInputSufficient;
+  const walletReady = !withPosition || (recovery
+    ? plan.wallet?.sufficient0 && plan.wallet?.sufficient1
+    : plan.wallet?.stableInputSufficient);
   const canExecute = plan.privateKeyConfigured
     && (!withPosition || plan.autoAllocationConfigured)
     && plan.executionEnabled
@@ -283,7 +385,7 @@ function renderPreview(plan) {
   elements.poolResult.innerHTML = `
     <div class="pool-state">
       <span>池状态</span>
-      <strong>新池 · 初始化预检通过</strong>
+      <strong>${recovery ? '恢复上次任务 · 跳过重复建池' : '新池 · 初始化预检通过'}</strong>
     </div>
     <dl class="preview-list">
       <div><dt>预计 Pool ID</dt><dd>${escapeHtml(plan.poolId)}</dd></div>
@@ -307,9 +409,11 @@ function renderPreview(plan) {
     ${plan.autoAllocation ? `
       <div class="pool-state">
         <span>自动兑换</span>
-        <strong>${plan.autoAllocation.required
+        <strong>${plan.autoAllocation.recovered
+          ? `复用上次已兑换资产，本次不再兑换`
+          : (plan.autoAllocation.required
           ? `${escapeHtml(plan.autoAllocation.stableToSwap)} ${escapeHtml(plan.quoteToken.symbol)} → 预计 ${escapeHtml(plan.autoAllocation.quotedTradeAmount)} ${escapeHtml(plan.tradeToken.symbol)}`
-          : `无需兑换，全部使用 ${escapeHtml(plan.quoteToken.symbol)}`}</strong>
+          : `无需兑换，全部使用 ${escapeHtml(plan.quoteToken.symbol)}`)}</strong>
       </div>
       <dl class="preview-list">
         <div><dt>保留用于仓位</dt><dd>${escapeHtml(plan.autoAllocation.quoteForLiquidity)} ${escapeHtml(plan.quoteToken.symbol)}</dd></div>
@@ -330,8 +434,10 @@ function renderPreview(plan) {
     ${plan.wallet ? `
       <dl class="preview-list">
         <div><dt>钱包 ${escapeHtml(plan.quoteToken.symbol)}</dt><dd>${escapeHtml(plan.wallet.stableBalance)} · ${plan.wallet.stableInputSufficient ? '投入充足' : '投入不足'}</dd></div>
+        ${recovery ? `<div><dt>钱包 ${escapeHtml(plan.tradeToken.symbol)}</dt><dd>${escapeHtml(plan.wallet.tradeBalance)} · ${plan.wallet.sufficient0 && plan.wallet.sufficient1 ? '恢复数量充足' : '恢复数量不足'}</dd></div>` : ''}
       </dl>
     ` : ''}
+    ${recovery ? '<div class="preview-warning">恢复模式只会补齐必要授权并创建仓位 NFT；不会重复建池或再次兑换。</div>' : ''}
     ${!plan.autoAllocationConfigured ? '<div class="preview-warning">未配置 OKX DEX API 凭证，无法完成稳定币自动分配。</div>' : ''}
     ${!plan.executionEnabled ? '<div class="preview-warning">只读预检可用；执行前需在 .env 中设置 LIQUIDITY_EXECUTE=true 并重启服务。</div>' : ''}
   ` : `
@@ -358,7 +464,9 @@ function renderPreview(plan) {
   } else if (withPosition && !plan.autoAllocationConfigured) {
     elements.formMessage.textContent = '未配置 OKX DEX API 凭证，不能执行自动分配。';
   } else if (withPosition && !walletReady) {
-    elements.formMessage.textContent = `钱包 ${plan.quoteToken.symbol} 余额不足，不能执行。`;
+    elements.formMessage.textContent = recovery
+      ? '钱包中上次已兑换的仓位资产数量不足，不能恢复。'
+      : `钱包 ${plan.quoteToken.symbol} 余额不足，不能执行。`;
   } else if (!plan.executionEnabled) {
     elements.formMessage.textContent = '执行开关未开启，当前只能预检。';
   } else if (blockingAction) {
@@ -388,14 +496,17 @@ function renderPreviewError(error) {
 
 function renderExecutionStarting(plan) {
   const withPosition = plan.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
+  const recovery = Boolean(plan.recoveryMode);
   resetRenderKey(elements.poolResult);
   resetRenderKey(elements.positionResult);
   setStageBadge(elements.previewState, '执行中', 'loading');
-  setStageBadge(elements.poolStageState, '创建中', 'loading');
-  setStageBadge(elements.positionStageState, withPosition ? '等待池子' : '本次跳过', withPosition ? 'loading' : 'ready');
+  setStageBadge(elements.poolStageState, recovery ? '已复用' : '创建中', recovery ? 'ready' : 'loading');
+  setStageBadge(elements.positionStageState, recovery ? '恢复中' : (withPosition ? '等待池子' : '本次跳过'), withPosition ? 'loading' : 'ready');
   elements.poolResult.className = 'preview-stack';
   elements.poolResult.innerHTML = `
-    ${loadingMarkup('正在创建池子', '池子确认后会立即在这里显示 Pool ID')}
+    ${recovery
+    ? '<div class="execution-result"><strong>已复用上次创建的池子</strong><p>本次不发送建池交易。</p></div>'
+    : loadingMarkup('正在创建池子', '池子确认后会立即在这里显示 Pool ID')}
     <dl class="preview-list">
       <div><dt>预计 Pool ID</dt><dd>${escapeHtml(plan.poolId)}</dd></div>
       <div><dt>交易对</dt><dd>${escapeHtml(plan.token0.symbol)} / ${escapeHtml(plan.token1.symbol)}</dd></div>
@@ -404,7 +515,9 @@ function renderExecutionStarting(plan) {
   elements.positionBlockTitle.textContent = withPosition ? '兑换与仓位' : '仓位处理';
   elements.positionResult.className = 'preview-stack';
   elements.positionResult.innerHTML = withPosition
-    ? loadingMarkup('等待池子创建完成', '之后将依次显示兑换、授权和添加仓位进度')
+    ? (recovery
+      ? loadingMarkup('正在恢复加仓', '只会补齐授权并添加仓位，不会再次兑换')
+      : loadingMarkup('等待池子创建完成', '之后将依次显示兑换、授权和添加仓位进度'))
     : '<div class="summary-empty">本次只创建池子，不会执行兑换、授权或添加仓位。</div>';
   elements.actionControls.hidden = true;
 }
@@ -542,6 +655,7 @@ function renderStoredAction(action, inFlight = false) {
         ${action.liquidityTxHash ? `<p>加池交易：${escapeHtml(action.liquidityTxHash)}</p>` : ''}
         ${action.currentTx?.hash ? `<p>待核对交易：${escapeHtml(action.currentTx.hash)}</p>` : ''}
         <p>${escapeHtml(action.error || '兑换或添加仓位流程没有完成')}</p>
+        ${action.resolution ? `<p>${escapeHtml(action.resolution)}</p>` : ''}
       `;
     } else if (cancelled) {
       setStageBadge(elements.positionStageState, '已结束');
@@ -614,6 +728,9 @@ async function resolveStoredAction() {
         : '未检测到目标池 NFT，待确认状态已解除，可发起新任务。';
       showToast(action.nftId ? `已识别 NFT #${action.nftId}` : '未发现仓位，已安全放行');
     }
+    if (action.stage === 'completed') {
+      window.dispatchEvent(new CustomEvent('liquidity:create-completed', { detail: action }));
+    }
   } catch (error) {
     if (error.data?.action) renderStoredAction(error.data.action, false);
     elements.formMessage.textContent = error.message;
@@ -681,6 +798,18 @@ function executeSummary() {
       '该 PoolKey 初始化后不能再次创建，且本次完成后池内仍没有流动性。确认发送建池交易吗？'
     ].join('\n');
   }
+  if (lastPreview.recoveryMode) {
+    return [
+      '执行模式：恢复上次未完成的加仓',
+      `复用池子：${lastPreview.poolId}`,
+      `复用钱包资产：${lastPreview.autoAllocation.quotedTradeAmount} ${lastPreview.tradeToken.symbol} + ${lastPreview.autoAllocation.quoteForLiquidity} ${lastPreview.quoteSymbol}`,
+      '建池交易：不发送',
+      '自动兑换：不执行',
+      '本次只会补齐必要的 ERC20 / Permit2 授权，然后发送一笔加仓交易。',
+      '',
+      '确认恢复加仓吗？'
+    ].join('\n');
+  }
   const allocation = lastPreview.autoAllocation;
   return [
     '池状态：新池，先独立初始化成功再执行兑换与加仓',
@@ -698,6 +827,7 @@ function executeSummary() {
 async function executeLiquidity() {
   if (!lastPreview || elements.executeButton.disabled) return;
   if (!window.confirm(executeSummary())) return;
+  persistFormSnapshot();
   const executionPreview = lastPreview;
   executionRequestPending = true;
   executionStartedAtMs = Date.now();
@@ -722,6 +852,8 @@ async function executeLiquidity() {
     showToast(executionPreview.executionMode === EXECUTION_MODE_INITIALIZE_ONLY
       ? '池子初始化完成'
       : '初始化流动性执行完成');
+    persistFormSnapshot();
+    window.dispatchEvent(new CustomEvent('liquidity:create-completed', { detail: action }));
     lastPreview = null;
   } catch (error) {
     if (error.data?.action) renderStoredAction(error.data.action, false);
@@ -746,6 +878,7 @@ function bindChoices() {
       document.querySelectorAll('[data-budget]').forEach((item) => item.classList.remove('active'));
       button.classList.add('active');
       selectedBudget = button.dataset.budget;
+      persistFormSnapshot();
       refreshConditionalFields();
       refreshWalletState();
       invalidatePreview();
@@ -759,6 +892,7 @@ function bindChoices() {
         type: button.dataset.range,
         percent: button.dataset.percent || null
       };
+      persistFormSnapshot();
       refreshConditionalFields();
       invalidatePreview();
     });
@@ -767,6 +901,8 @@ function bindChoices() {
 
 function bindInputs() {
   elements.form.addEventListener('submit', preview);
+  elements.form.addEventListener('input', persistFormSnapshot);
+  elements.form.addEventListener('change', persistFormSnapshot);
   elements.executeButton.addEventListener('click', executeLiquidity);
   elements.resolveActionButton.addEventListener('click', resolveStoredAction);
   elements.quoteToken.addEventListener('change', () => {
@@ -786,6 +922,7 @@ function bindInputs() {
   elements.hooksPreset.addEventListener('change', () => {
     elements.hooks.value = elements.hooksPreset.value || ZERO_ADDRESS;
     syncHooksPresetFromAddress();
+    persistFormSnapshot();
     refreshConditionalFields();
     invalidatePreview();
   });
@@ -873,7 +1010,7 @@ function refreshWalletState() {
   if (!options.privateKeyConfigured) {
     elements.walletState.className = 'wallet-state blocked';
     elements.walletState.textContent = '未配置 PRIVATE_KEY · 仅预检';
-  } else if (addsLiquidity() && !options.autoAllocationConfigured) {
+  } else if (addsLiquidity() && !options.autoAllocationConfigured && !options.recoveryAvailable) {
     elements.walletState.className = 'wallet-state blocked';
     elements.walletState.textContent = `${options.walletAddress} · 自动分配未配置`;
   } else if (!options.executionEnabled) {
@@ -889,6 +1026,46 @@ function refreshWalletState() {
   }
 }
 
+function loadRecoveryRequest(action) {
+  if (!options?.recoveryAvailable || !action?.request) return false;
+  const request = action.request;
+  elements.tradeToken.value = request.tradeToken || '';
+  elements.quoteToken.value = request.quoteToken || elements.quoteToken.value;
+  elements.price.value = request.price || '';
+  elements.feePercent.value = request.feePercent ?? '';
+  elements.tickSpacing.value = request.tickSpacing ?? '';
+  elements.hooks.value = request.hooks || ZERO_ADDRESS;
+  elements.acknowledgeCustomHooks.checked = Boolean(request.acknowledgeCustomHooks);
+
+  const budget = String(request.budget || '');
+  const budgetButton = [...document.querySelectorAll('[data-budget]')]
+    .find((button) => button.dataset.budget === budget);
+  selectedBudget = budgetButton ? budget : 'custom';
+  elements.customBudget.value = budget;
+  document.querySelectorAll('[data-budget]').forEach((button) => {
+    button.classList.toggle('active', button.dataset.budget === selectedBudget);
+  });
+
+  const matchingRange = [...document.querySelectorAll('[data-range]')].find((button) => (
+    button.dataset.range === request.rangeType
+      && (request.rangeType !== 'percent' || button.dataset.percent === String(request.rangePercent))
+  ));
+  selectedRange = matchingRange
+    ? { type: matchingRange.dataset.range, percent: matchingRange.dataset.percent || null }
+    : { type: request.rangeType || 'custom', percent: request.rangePercent || null };
+  elements.lowerPrice.value = request.lowerPrice || '';
+  elements.upperPrice.value = request.upperPrice || '';
+  document.querySelectorAll('[data-range]').forEach((button) => {
+    button.classList.toggle('active', button === matchingRange);
+  });
+
+  syncHooksPresetFromAddress();
+  refreshConditionalFields();
+  refreshQuote();
+  persistFormSnapshot();
+  return true;
+}
+
 async function loadOptions() {
   try {
     options = await request('/api/liquidity/options');
@@ -896,9 +1073,14 @@ async function loadOptions() {
       `<option value="${escapeHtml(item.address)}">${escapeHtml(item.symbol)}</option>`
     )).join('');
     renderHookPresets();
+    const recoveryLoaded = loadRecoveryRequest(options.lastAction);
+    if (!recoveryLoaded) restoreFormSnapshot();
     refreshQuote();
     refreshWalletState();
     renderStoredAction(options.lastAction, options.inFlight);
+    if (recoveryLoaded) {
+      elements.formMessage.textContent = '已载入上次失败任务的原参数；点击“只读预检”后可恢复加仓，不会再次兑换。';
+    }
     if (options.inFlight) statusTimer = setTimeout(pollStatus, 1000);
     restartBalancePolling();
   } catch (error) {
@@ -910,5 +1092,6 @@ async function loadOptions() {
 
 bindChoices();
 bindInputs();
+window.addEventListener('liquidity:open-create', restoreFormSnapshot);
 refreshConditionalFields();
 loadOptions();

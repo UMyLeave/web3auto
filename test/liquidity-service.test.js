@@ -9,6 +9,7 @@ import {
   assertExecutionPlanInvariant,
   assertLiquidityPreviewAuthorization,
   assertPoolAvailableForCreation,
+  createLiquidityFallbackProvider,
   decimalFraction,
   encodeInitializePool,
   encodeLiquidityTransaction,
@@ -16,6 +17,7 @@ import {
   exactAllowanceActions,
   findActionTargetPoolPositions,
   integerSqrt,
+  isRecoverableLiquidityAction,
   liquidityExecutionFingerprint,
   liquidityRangeTicks,
   normalizeLiquidityInput,
@@ -24,6 +26,7 @@ import {
   priceToSqrtPriceX96,
   reusableAllowanceActions,
   reusablePermit2ApprovalRequired,
+  recoveryAmountCaps,
   resolveLiquidityRangeTicks,
   sqrtPriceAtTick,
   stableBudgetAllocation,
@@ -45,6 +48,40 @@ const config = {
   maxFeePercent: 10,
   stablecoins: [{ symbol: 'USDT', address: QUOTE }]
 };
+
+class TestRpcProvider extends ethers.AbstractProvider {
+  constructor({ balance, callError = null }) {
+    super(56, { cacheTimeout: -1 });
+    this.balance = balance;
+    this.callError = callError;
+  }
+
+  async _detectNetwork() {
+    return ethers.Network.from(56);
+  }
+
+  async _perform(request) {
+    if (request.method === 'getBlockNumber') return 123;
+    if (request.method === 'getBalance') {
+      if (this.callError) throw this.callError;
+      return this.balance;
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  }
+}
+
+test('liquidity RPC provider reaches quorum after one backend TLS failure', async () => {
+  const provider = createLiquidityFallbackProvider([
+    new TestRpcProvider({ callError: Object.assign(new Error('TLS disconnected'), { code: 'ECONNRESET' }) }),
+    new TestRpcProvider({ balance: 42n }),
+    new TestRpcProvider({ balance: 42n })
+  ], { rpcQuorum: 2, rpcStallTimeoutMs: 100 });
+  try {
+    assert.equal(await provider.getBalance(OWNER), 42n);
+  } finally {
+    await provider.destroy();
+  }
+});
 
 test('TickMath matches official Uniswap v4 vectors and the monitor implementation', () => {
   for (const tick of [-887000, -10000, -4096, -128, -1, 0, 1, 128, 4096, 10000, 887000]) {
@@ -267,6 +304,56 @@ test('only a submitted mint transaction requires NFT reconciliation', () => {
     currentTx: null,
     liquidityTxHash: `0x${'56'.repeat(32)}`
   }), true);
+});
+
+test('a matching failed post-swap action can resume without another swap', () => {
+  const request = {
+    tradeToken: TRADE,
+    quoteToken: QUOTE,
+    executionMode: 'initialize_and_add',
+    price: '1',
+    budget: '20',
+    feePercent: '0.3',
+    tickSpacing: '60',
+    rangeType: 'percent',
+    rangePercent: '50',
+    lowerPrice: null,
+    upperPrice: null,
+    hooks: ethers.ZeroAddress,
+    acknowledgeCustomHooks: false
+  };
+  const action = {
+    id: 'failed-action',
+    stage: 'failed',
+    wallet: OWNER,
+    executionMode: 'initialize_and_add',
+    request,
+    plan: {
+      token0: { amountMax: '12.5', decimals: 18 },
+      token1: { amountMax: '7.5', decimals: 18 }
+    },
+    autoSwap: { status: 'confirmed', hash: `0x${'12'.repeat(32)}` },
+    currentTx: null,
+    transactions: [{
+      kind: 'initialize_pool',
+      status: 'confirmed',
+      blockNumber: 123
+    }],
+    positionReconciliation: { found: false }
+  };
+  const input = normalizeLiquidityInput(request, config);
+  assert.equal(isRecoverableLiquidityAction(action, input, config, OWNER), true);
+  assert.deepEqual(recoveryAmountCaps(action), {
+    amount0Max: ethers.parseEther('12.5'),
+    amount1Max: ethers.parseEther('7.5')
+  });
+
+  const differentInput = normalizeLiquidityInput({ ...request, budget: '21' }, config);
+  assert.equal(isRecoverableLiquidityAction(action, differentInput, config, OWNER), false);
+  assert.equal(isRecoverableLiquidityAction({
+    ...action,
+    liquidityTxHash: `0x${'34'.repeat(32)}`
+  }, input, config, OWNER), false);
 });
 
 test('failed liquidity execution records a detected target-pool NFT', () => {

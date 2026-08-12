@@ -20,6 +20,12 @@ let latestPositions = null;
 let refreshFailures = 0;
 let refreshTimer = null;
 let initialLookupScheduled = false;
+// The monitoring route should only poll monitor status. Position preview is
+// available through the explicit read-only check, so it must not add a second
+// background RPC loop while the monitor is running.
+const AUTO_POSITION_LOOKUP_ENABLED = false;
+const ESCAPE_DOUBLE_PRESS_MS = 500;
+let lastEscapeAt = 0;
 const toastKeys = new Map();
 
 async function request(url, options = {}) {
@@ -384,7 +390,7 @@ function nextRefreshDelay() {
 
 async function pollStatus() {
   const connected = await refresh();
-  if (connected && !initialLookupScheduled) {
+  if (connected && AUTO_POSITION_LOOKUP_ENABLED && !initialLookupScheduled) {
     initialLookupScheduled = true;
     schedulePositionLookup();
   }
@@ -512,7 +518,7 @@ function markIdChanged() {
   latestPositions = null;
   $('targetPosition').textContent = '-';
   updateButtons(currentStatus);
-  schedulePositionLookup();
+  if (AUTO_POSITION_LOOKUP_ENABLED) schedulePositionLookup();
 }
 
 async function saveCurrentConfig() {
@@ -592,13 +598,26 @@ $('closeAlert').onclick = () => {
   $('alertDrawer').setAttribute('aria-hidden', 'true');
 };
 
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || event.repeat) return;
+  const now = Date.now();
+  const doublePressed = now - lastEscapeAt <= ESCAPE_DOUBLE_PRESS_MS;
+  lastEscapeAt = now;
+  if (!doublePressed || !alarmActive) return;
+  lastEscapeAt = 0;
+  stopAlarm();
+  notify('已关闭本次预警提示音', 'info', 'alarm-dismissed-by-escape');
+});
+
 if (window.location.protocol === 'file:') {
   $('mode').textContent = '本地预览模式';
   $('running').textContent = '未连接服务';
   $('error').textContent = '当前为本地预览：页面样式可正常查看，监控和配置功能请通过 npm start 启动服务后访问。';
 } else {
   void pollStatus();
-  setInterval(() => {
-    if (refreshFailures === 0 && !formDirty && !currentStatus?.inFlight) lookupPositions({ silent: true });
-  }, 5000);
+  if (AUTO_POSITION_LOOKUP_ENABLED) {
+    setInterval(() => {
+      if (refreshFailures === 0 && !formDirty && !currentStatus?.inFlight) lookupPositions({ silent: true });
+    }, 5000);
+  }
 }

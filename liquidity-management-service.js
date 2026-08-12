@@ -10,7 +10,8 @@ import {
   reusableAllowanceActions,
   reusablePermit2ApprovalRequired,
   sqrtPriceAtTick,
-  stableBudgetAllocation
+  stableBudgetAllocation,
+  createLiquidityFallbackProvider
 } from './liquidity-service.js';
 import { okxCredentialsConfigured } from './liquidity-swap-service.js';
 import {
@@ -23,17 +24,24 @@ import { verifyConfiguredWhitelistHook } from './liquidity-hook-service.js';
 const CHAIN_ID = 56n;
 const ZERO = ethers.ZeroAddress;
 const Q96 = 1n << 96n;
+const Q128 = 1n << 128n;
 const Q192 = 1n << 192n;
 const UINT24_MASK = 0xffffffn;
 const UINT160_MASK = (1n << 160n) - 1n;
+const UINT256_MASK = (1n << 256n) - 1n;
 const MAX_UINT128 = (1n << 128n) - 1n;
+const POOLS_SLOT = 6n;
+const TICKS_OFFSET = 4n;
+const POSITIONS_OFFSET = 6n;
 const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
 const TERMINAL_STAGES = new Set(['completed', 'failed', 'cancelled']);
 const OPERATIONS = new Set(['increase', 'withdraw', 'reduce', 'emergency']);
+const MAX_ACTION_HISTORY = 50;
 
 const POSITION_ABI = [
   'function poolManager() view returns (address)',
   'function permit2() view returns (address)',
+  'function balanceOf(address owner) view returns (uint256)',
   'function getPositionLiquidity(uint256 tokenId) view returns (uint128)',
   'function getPoolAndPositionInfo(uint256 tokenId) view returns ((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks),uint256 info)',
   'function ownerOf(uint256 tokenId) view returns (address)',
@@ -47,7 +55,10 @@ const ERC20_ABI = [
   'function symbol() view returns (string)',
   'function decimals() view returns (uint8)'
 ];
-const POOL_MANAGER_ABI = ['function extsload(bytes32 slot) view returns (bytes32)'];
+const POOL_MANAGER_ABI = [
+  'function extsload(bytes32 slot) view returns (bytes32)',
+  'function extsload(bytes32[] slots) view returns (bytes32[])'
+];
 const PERMIT2_ABI = [
   'function allowance(address user,address token,address spender) view returns (uint160 amount,uint48 expiration,uint48 nonce)',
   'function approve(address token,address spender,uint160 amount,uint48 expiration)'
@@ -55,6 +66,12 @@ const PERMIT2_ABI = [
 const POSITION_INTERFACE = new ethers.Interface(POSITION_ABI);
 const ERC20_INTERFACE = new ethers.Interface(ERC20_ABI);
 const PERMIT2_INTERFACE = new ethers.Interface(PERMIT2_ABI);
+const ERC721_TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+const DEFAULT_POSITION_REFRESH_MS = 1500;
+const DEFAULT_POSITION_SCAN_INTERVAL_MS = 5000;
+const DEFAULT_POSITION_SCAN_WINDOW_BLOCKS = 3_000_000;
+const DEFAULT_POSITION_INITIAL_SCAN_WINDOW_BLOCKS = 100_000;
+const DEFAULT_POSITION_HISTORY_SCAN_INTERVAL_MS = 30_000;
 
 async function readJson(path) {
   return JSON.parse(await fs.readFile(path, 'utf8'));
@@ -78,22 +95,37 @@ function withTimeout(promise, timeoutMs, message) {
 
 async function openProvider(config) {
   const timeoutMs = Math.max(1000, Number(config.rpcTimeoutMs) || 5000);
+  const urls = [...new Set((config.rpcUrls || []).filter(Boolean))];
+  if (!urls.length) throw new Error('没有可用的 BSC RPC：未配置 rpcUrls');
   const errors = [];
-  for (const url of config.rpcUrls || []) {
-    const provider = new ethers.JsonRpcProvider(url, Number(CHAIN_ID), {
+  const providers = urls.map((url) => new ethers.JsonRpcProvider(url, Number(CHAIN_ID), {
       batchMaxCount: 1,
       staticNetwork: true
-    });
-    try {
-      const network = await withTimeout(provider.getNetwork(), timeoutMs, `RPC 连接超时：${url}`);
-      if (network.chainId !== CHAIN_ID) throw new Error(`RPC chainId 不是 56：${url}`);
-      return provider;
-    } catch (error) {
-      errors.push(error.message);
-      provider.destroy();
+    }));
+  const checks = await Promise.allSettled(providers.map((provider, index) => (
+    withTimeout(provider.getNetwork(), timeoutMs, `RPC 连接超时：${urls[index]}`)
+      .then((network) => {
+        if (network.chainId !== CHAIN_ID) throw new Error(`RPC chainId 不是 56：${urls[index]}`);
+        return provider;
+      })
+  )));
+  const available = [];
+  checks.forEach((result, index) => {
+    if (result.status === 'fulfilled') available.push(result.value);
+    else {
+      errors.push(`${urls[index]}: ${result.reason?.message || '连接失败'}`);
+      providers[index].destroy();
     }
+  });
+  if (!available.length) {
+    throw new Error(`没有可用的 BSC RPC：${errors.at(-1) || '连接失败'}`);
   }
-  throw new Error(`没有可用的 BSC RPC：${errors.at(-1) || '未配置 rpcUrls'}`);
+  // Keep the previous single-node behavior by default, but fall back to the
+  // next healthy endpoint when a node rejects historical eth_getLogs headers.
+  const fallbackConfig = Number.isSafeInteger(Number(config.rpcQuorum))
+    ? config
+    : { ...config, rpcQuorum: 1 };
+  return createLiquidityFallbackProvider(available, fallbackConfig);
 }
 
 function normalizeStablecoins(config) {
@@ -173,6 +205,31 @@ export function managementActionBlocksExecution(action) {
   ));
 }
 
+export function managementActionRecord(action) {
+  if (!action?.id || !action.operation || !action.nftId || !action.stage) return null;
+  return {
+    id: String(action.id),
+    operation: String(action.operation),
+    nftId: String(action.nftId),
+    stage: String(action.stage),
+    startedAt: action.startedAt || null,
+    completedAt: action.completedAt || null,
+    failedAt: action.failedAt || null,
+    finalLiquidity: action.finalLiquidity === undefined ? null : String(action.finalLiquidity),
+    error: action.error || null
+  };
+}
+
+export function updateManagementActionHistory(history, action, limit = MAX_ACTION_HISTORY) {
+  const record = managementActionRecord(action);
+  const current = Array.isArray(history) ? history : [];
+  if (!record) return current.slice(0, limit);
+  return [
+    record,
+    ...current.filter((item) => item?.id !== record.id)
+  ].slice(0, Math.max(1, Number(limit) || MAX_ACTION_HISTORY));
+}
+
 export function minimumRemovalAmounts(amount0, amount1, slippageBps) {
   const bps = Number(slippageBps);
   if (!Number.isInteger(bps) || bps < 0 || bps > 5000) throw new Error('流动性滑点配置无效');
@@ -243,6 +300,75 @@ function sqrtPriceToHumanPrice(sqrtPriceX96, tradeDecimals, quoteDecimals, trade
   return price.toFixed(24).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+export function managementPriceRange({
+  tickLower,
+  tickUpper,
+  currentTick,
+  tickSpacing,
+  tradeDecimals,
+  stableDecimals,
+  tradeIsCurrency0,
+  activePrice
+}) {
+  const lowerTick = Number(tickLower);
+  const upperTick = Number(tickUpper);
+  const activeTick = Number(currentTick);
+  const spacing = Math.abs(Number(tickSpacing));
+  if (![lowerTick, upperTick, activeTick, spacing].every(Number.isFinite)
+    || !Number.isInteger(spacing) || spacing <= 0 || upperTick <= lowerTick) {
+    throw new Error('仓位 Tick 区间无法用于价格展示');
+  }
+  const boundaryPrices = [
+    sqrtPriceToHumanPrice(
+      sqrtPriceAtTick(lowerTick),
+      tradeDecimals,
+      stableDecimals,
+      tradeIsCurrency0
+    ),
+    sqrtPriceToHumanPrice(
+      sqrtPriceAtTick(upperTick),
+      tradeDecimals,
+      stableDecimals,
+      tradeIsCurrency0
+    )
+  ];
+  const orderedPrices = boundaryPrices.sort((left, right) => Number(left) - Number(right));
+  const currentPrice = Number(activePrice);
+  const lowerPrice = Number(orderedPrices[0]);
+  const upperPrice = Number(orderedPrices[1]);
+  if (![currentPrice, lowerPrice, upperPrice].every(Number.isFinite) || currentPrice <= 0) {
+    throw new Error('仓位价格无法用于区间展示');
+  }
+  const gridCount = Math.max(1, Math.round((upperTick - lowerTick) / spacing));
+  const rawGrid = tradeIsCurrency0
+    ? Math.floor((activeTick - lowerTick) / spacing)
+    : Math.floor((upperTick - activeTick) / spacing);
+  const rawPosition = tradeIsCurrency0
+    ? (activeTick - lowerTick) / (upperTick - lowerTick)
+    : (upperTick - activeTick) / (upperTick - lowerTick);
+  const rangeState = currentPrice < lowerPrice
+    ? 'below'
+    : currentPrice > upperPrice ? 'above' : 'inside';
+  const distancePercent = rangeState === 'below'
+    ? (lowerPrice - currentPrice) * 100 / currentPrice
+    : rangeState === 'above'
+      ? (currentPrice - upperPrice) * 100 / currentPrice
+      : 0;
+  return {
+    lowerPrice: orderedPrices[0],
+    currentPrice: String(activePrice),
+    upperPrice: orderedPrices[1],
+    rangeWidthPercent: ((upperPrice - lowerPrice) * 100 / currentPrice).toFixed(2),
+    gridCount,
+    currentGrid: rangeState === 'below'
+      ? 0
+      : rangeState === 'above' ? gridCount + 1 : Math.max(0, Math.min(gridCount, rawGrid)),
+    positionPercent: rawPosition * 100,
+    rangeState,
+    distancePercent: distancePercent.toFixed(2)
+  };
+}
+
 async function strictTokenMetadata(provider, token) {
   const address = ethers.getAddress(token);
   const code = await provider.getCode(address);
@@ -263,10 +389,10 @@ async function strictTokenMetadata(provider, token) {
 
 async function poolState(provider, poolManagerAddress, poolKey) {
   const poolId = poolIdOf(poolKey);
-  const poolsSlot = ethers.zeroPadValue(ethers.toBeHex(6), 32);
+  const poolsSlot = ethers.zeroPadValue(ethers.toBeHex(POOLS_SLOT), 32);
   const stateSlot = ethers.keccak256(ethers.solidityPacked(['bytes32', 'bytes32'], [poolId, poolsSlot]));
   const manager = new ethers.Contract(poolManagerAddress, POOL_MANAGER_ABI, provider);
-  const slot0 = BigInt(await manager.extsload(stateSlot));
+  const slot0 = BigInt(await manager['extsload(bytes32)'](stateSlot));
   const sqrtPriceX96 = slot0 & UINT160_MASK;
   if (sqrtPriceX96 === 0n) throw new Error('NFT 对应的池子尚未初始化');
   return {
@@ -274,6 +400,139 @@ async function poolState(provider, poolManagerAddress, poolKey) {
     sqrtPriceX96,
     currentTick: signed24(slot0 >> 160n)
   };
+}
+
+function storageSlot(value) {
+  return ethers.zeroPadValue(ethers.toBeHex(BigInt(value) & UINT256_MASK), 32);
+}
+
+function addStorageSlot(slot, offset) {
+  return (BigInt(slot) + BigInt(offset)) & UINT256_MASK;
+}
+
+export function managementFeeGrowthInside({
+  currentTick,
+  tickLower,
+  tickUpper,
+  feeGrowthGlobal0X128,
+  feeGrowthGlobal1X128,
+  lowerFeeGrowthOutside0X128,
+  lowerFeeGrowthOutside1X128,
+  upperFeeGrowthOutside0X128,
+  upperFeeGrowthOutside1X128
+}) {
+  const current = Number(currentTick);
+  const lower = Number(tickLower);
+  const upper = Number(tickUpper);
+  const growth = (global, lowerOutside, upperOutside) => {
+    const globalValue = BigInt(global);
+    const lowerValue = BigInt(lowerOutside);
+    const upperValue = BigInt(upperOutside);
+    if (current < lower) return (lowerValue - upperValue) & UINT256_MASK;
+    if (current >= upper) return (upperValue - lowerValue) & UINT256_MASK;
+    return (globalValue - lowerValue - upperValue) & UINT256_MASK;
+  };
+  return {
+    feeGrowthInside0X128: growth(
+      feeGrowthGlobal0X128,
+      lowerFeeGrowthOutside0X128,
+      upperFeeGrowthOutside0X128
+    ),
+    feeGrowthInside1X128: growth(
+      feeGrowthGlobal1X128,
+      lowerFeeGrowthOutside1X128,
+      upperFeeGrowthOutside1X128
+    )
+  };
+}
+
+export function managementUncollectedFees({
+  liquidity,
+  feeGrowthInside0X128,
+  feeGrowthInside1X128,
+  feeGrowthInside0LastX128,
+  feeGrowthInside1LastX128
+}) {
+  const positionLiquidity = BigInt(liquidity);
+  return {
+    amount0: (((BigInt(feeGrowthInside0X128) - BigInt(feeGrowthInside0LastX128)) & UINT256_MASK)
+      * positionLiquidity) / Q128,
+    amount1: (((BigInt(feeGrowthInside1X128) - BigInt(feeGrowthInside1LastX128)) & UINT256_MASK)
+      * positionLiquidity) / Q128
+  };
+}
+
+async function positionUncollectedFees({
+  provider,
+  poolManagerAddress,
+  positionManagerAddress,
+  poolId,
+  nftId,
+  liquidity,
+  tickLower,
+  tickUpper,
+  currentTick
+}) {
+  if (BigInt(liquidity) === 0n) return { amount0: 0n, amount1: 0n };
+  const stateSlot = BigInt(ethers.keccak256(ethers.solidityPacked(
+    ['bytes32', 'uint256'],
+    [poolId, POOLS_SLOT]
+  )));
+  const tickMappingSlot = storageSlot(addStorageSlot(stateSlot, TICKS_OFFSET));
+  const tickSlot = (tick) => BigInt(ethers.keccak256(ethers.solidityPacked(
+    ['int256', 'bytes32'],
+    [BigInt(tick), tickMappingSlot]
+  )));
+  const positionId = ethers.solidityPackedKeccak256(
+    ['address', 'int24', 'int24', 'bytes32'],
+    [positionManagerAddress, tickLower, tickUpper, storageSlot(nftId)]
+  );
+  const positionMappingSlot = storageSlot(addStorageSlot(stateSlot, POSITIONS_OFFSET));
+  const positionSlot = BigInt(ethers.keccak256(ethers.solidityPacked(
+    ['bytes32', 'bytes32'],
+    [positionId, positionMappingSlot]
+  )));
+  const lowerTickSlot = tickSlot(tickLower);
+  const upperTickSlot = tickSlot(tickUpper);
+  const slots = [
+    storageSlot(addStorageSlot(stateSlot, 1n)),
+    storageSlot(addStorageSlot(stateSlot, 2n)),
+    storageSlot(addStorageSlot(lowerTickSlot, 1n)),
+    storageSlot(addStorageSlot(lowerTickSlot, 2n)),
+    storageSlot(addStorageSlot(upperTickSlot, 1n)),
+    storageSlot(addStorageSlot(upperTickSlot, 2n)),
+    storageSlot(addStorageSlot(positionSlot, 1n)),
+    storageSlot(addStorageSlot(positionSlot, 2n))
+  ];
+  const manager = new ethers.Contract(poolManagerAddress, POOL_MANAGER_ABI, provider);
+  const words = (await manager['extsload(bytes32[])'](slots)).map(BigInt);
+  const [
+    feeGrowthGlobal0X128,
+    feeGrowthGlobal1X128,
+    lowerFeeGrowthOutside0X128,
+    lowerFeeGrowthOutside1X128,
+    upperFeeGrowthOutside0X128,
+    upperFeeGrowthOutside1X128,
+    feeGrowthInside0LastX128,
+    feeGrowthInside1LastX128
+  ] = words;
+  const inside = managementFeeGrowthInside({
+    currentTick,
+    tickLower,
+    tickUpper,
+    feeGrowthGlobal0X128,
+    feeGrowthGlobal1X128,
+    lowerFeeGrowthOutside0X128,
+    lowerFeeGrowthOutside1X128,
+    upperFeeGrowthOutside0X128,
+    upperFeeGrowthOutside1X128
+  });
+  return managementUncollectedFees({
+    liquidity,
+    ...inside,
+    feeGrowthInside0LastX128,
+    feeGrowthInside1LastX128
+  });
 }
 
 async function readPosition(provider, config, nftId, requiredOwner = null) {
@@ -316,6 +575,25 @@ async function readPosition(provider, config, nftId, requiredOwner = null) {
     tickLower,
     tickUpper
   );
+  let uncollectedFees = null;
+  let feeReadError = null;
+  try {
+    uncollectedFees = await positionUncollectedFees({
+      provider,
+      poolManagerAddress: ethers.getAddress(poolManagerAddress),
+      positionManagerAddress,
+      poolId: pool.poolId,
+      nftId,
+      liquidity,
+      tickLower,
+      tickUpper,
+      currentTick: pool.currentTick
+    });
+  } catch (error) {
+    // A fee read must never hide an otherwise valid position. Keep principal
+    // values available and surface the fee-read status separately.
+    feeReadError = error.message;
+  }
   const stablecoins = normalizeStablecoins(config);
   const stable0 = stablecoins.find((entry) => entry.address === token0.address) || null;
   const stable1 = stablecoins.find((entry) => entry.address === token1.address) || null;
@@ -325,9 +603,23 @@ async function readPosition(provider, config, nftId, requiredOwner = null) {
     : stablecoinIndex === 1 ? { ...token1, configuredSymbol: stable1.symbol } : null;
   const tradeToken = stablecoinIndex === 0 ? token1 : stablecoinIndex === 1 ? token0 : null;
   const tradeIsCurrency0 = tradeToken?.address === poolKey.currency0;
-  const valueRaw = stablecoinIndex === null ? null : tokenValueInStablecoin(
+  const feeAmount0 = uncollectedFees?.amount0 || 0n;
+  const feeAmount1 = uncollectedFees?.amount1 || 0n;
+  const principalValueRaw = stablecoinIndex === null ? null : tokenValueInStablecoin(
     principal.amount0,
     principal.amount1,
+    pool.sqrtPriceX96,
+    stablecoinIndex
+  );
+  const feeValueRaw = stablecoinIndex === null || !uncollectedFees ? null : tokenValueInStablecoin(
+    feeAmount0,
+    feeAmount1,
+    pool.sqrtPriceX96,
+    stablecoinIndex
+  );
+  const valueRaw = stablecoinIndex === null ? null : tokenValueInStablecoin(
+    principal.amount0 + feeAmount0,
+    principal.amount1 + feeAmount1,
     pool.sqrtPriceX96,
     stablecoinIndex
   );
@@ -351,6 +643,9 @@ async function readPosition(provider, config, nftId, requiredOwner = null) {
     token1,
     amount0: principal.amount0,
     amount1: principal.amount1,
+    feeAmount0: uncollectedFees ? feeAmount0 : null,
+    feeAmount1: uncollectedFees ? feeAmount1 : null,
+    feeReadError,
     stablecoinIndex,
     stablecoin,
     tradeToken,
@@ -364,6 +659,8 @@ async function readPosition(provider, config, nftId, requiredOwner = null) {
       )
       : null,
     valueRaw,
+    principalValueRaw,
+    feeValueRaw,
     balance0: walletBalances[0],
     balance1: walletBalances[1]
   };
@@ -376,6 +673,23 @@ function formatted(value, decimals) {
 function publicPosition(position) {
   const inRange = position.pool.currentTick >= position.tickLower
     && position.pool.currentTick < position.tickUpper;
+  let priceRange = null;
+  if (position.stablecoin && position.tradeToken) {
+    try {
+      priceRange = managementPriceRange({
+        tickLower: position.tickLower,
+        tickUpper: position.tickUpper,
+        currentTick: position.pool.currentTick,
+        tickSpacing: position.poolKey.tickSpacing,
+        tradeDecimals: position.tradeToken.decimals,
+        stableDecimals: position.stablecoin.decimals,
+        tradeIsCurrency0: position.tradeIsCurrency0,
+        activePrice: position.activePrice
+      });
+    } catch {
+      priceRange = null;
+    }
+  }
   return {
     nftId: position.nftId,
     owner: position.owner,
@@ -387,6 +701,7 @@ function publicPosition(position) {
     inRange,
     liquidity: position.liquidity.toString(),
     activePrice: position.activePrice,
+    priceRange,
     supported: position.stablecoinIndex !== null,
     unsupportedReason: position.stablecoinIndex === null
       ? '仓位必须包含且只包含一个流动性模块白名单稳定币'
@@ -394,12 +709,18 @@ function publicPosition(position) {
     token0: {
       ...position.token0,
       amount: formatted(position.amount0, position.token0.decimals),
+      uncollectedFee: position.feeAmount0 === null
+        ? null
+        : formatted(position.feeAmount0, position.token0.decimals),
       balance: position.balance0 === null ? null : formatted(position.balance0, position.token0.decimals),
       isStablecoin: position.stablecoinIndex === 0
     },
     token1: {
       ...position.token1,
       amount: formatted(position.amount1, position.token1.decimals),
+      uncollectedFee: position.feeAmount1 === null
+        ? null
+        : formatted(position.feeAmount1, position.token1.decimals),
       balance: position.balance1 === null ? null : formatted(position.balance1, position.token1.decimals),
       isStablecoin: position.stablecoinIndex === 1
     },
@@ -409,6 +730,21 @@ function publicPosition(position) {
       decimals: position.stablecoin.decimals
     } : null,
     tradeToken: position.tradeToken,
+    feeReadError: position.feeReadError,
+    uncollectedFees: position.feeAmount0 === null || position.feeAmount1 === null ? null : {
+      token0Raw: position.feeAmount0.toString(),
+      token1Raw: position.feeAmount1.toString(),
+      valueInStablecoin: position.feeValueRaw === null ? null : {
+        raw: position.feeValueRaw.toString(),
+        formatted: formatted(position.feeValueRaw, position.stablecoin.decimals),
+        symbol: position.stablecoin.configuredSymbol || position.stablecoin.symbol
+      }
+    },
+    principalValueInStablecoin: position.principalValueRaw === null ? null : {
+      raw: position.principalValueRaw.toString(),
+      formatted: formatted(position.principalValueRaw, position.stablecoin.decimals),
+      symbol: position.stablecoin.configuredSymbol || position.stablecoin.symbol
+    },
     valueInStablecoin: position.valueRaw === null ? null : {
       raw: position.valueRaw.toString(),
       formatted: formatted(position.valueRaw, position.stablecoin.decimals),
@@ -418,6 +754,291 @@ function publicPosition(position) {
       ? null
       : '该仓位包含 Hooks；本次操作会执行池子的外部 Hooks 逻辑'
   };
+}
+
+function configuredPositionScanStartBlock(config, headBlock) {
+  const configured = Number(config.positionScanStartBlock);
+  // `0` used to make the first request scan from genesis. On public BSC RPCs
+  // that can take minutes or fail with `header not found`, so zero now means
+  // "use the configured recent-history window". A positive value remains an
+  // explicit start block for deployments that need a fixed boundary.
+  if (Number.isSafeInteger(configured) && configured > 0) {
+    return Math.min(configured, headBlock);
+  }
+  const windowBlocks = Number(config.positionScanWindowBlocks);
+  if (Number.isSafeInteger(windowBlocks) && windowBlocks > 0) {
+    return Math.max(0, headBlock - windowBlocks + 1);
+  }
+  // A full scan is the safest default for wallets that already own positions.
+  // The result is cached and the incremental scan is throttled below, so this
+  // is not repeated for every UI refresh.
+  return 0;
+}
+
+function configuredPositionInitialScanStartBlock(config, headBlock, historyStart) {
+  const configuredWindow = Number(config.positionInitialScanWindowBlocks);
+  const windowBlocks = Number.isSafeInteger(configuredWindow) && configuredWindow > 0
+    ? configuredWindow
+    : DEFAULT_POSITION_INITIAL_SCAN_WINDOW_BLOCKS;
+  return Math.max(historyStart, headBlock - windowBlocks + 1);
+}
+
+function positionScanFallbackStartBlock(config, headBlock) {
+  const configuredWindow = Number(config.positionScanWindowBlocks);
+  const windowBlocks = Number.isSafeInteger(configuredWindow) && configuredWindow > 0
+    ? configuredWindow
+    : DEFAULT_POSITION_SCAN_WINDOW_BLOCKS;
+  return Math.max(0, headBlock - windowBlocks + 1);
+}
+
+function isHistoricalBlockUnavailable(error) {
+  const message = [
+    error?.message,
+    error?.shortMessage,
+    error?.error?.message,
+    error?.info?.error?.message
+  ].filter(Boolean).join(' ');
+  return /header not found|block not found|unknown block|missing trie node/i.test(message);
+}
+
+function positionTransferTokenId(log) {
+  return log?.topics?.[3] ? BigInt(log.topics[3]).toString() : null;
+}
+
+async function scanOwnedPositionTransfers(provider, positionManager, owner, fromBlock, toBlock, config) {
+  if (fromBlock > toBlock) return [];
+  const ownerTopic = ethers.zeroPadValue(owner, 32).toLowerCase();
+  const configuredChunk = Number(config.positionScanChunkBlocks);
+  const initialChunk = Number.isSafeInteger(configuredChunk) && configuredChunk >= 1_000
+    ? Math.min(configuredChunk, 100_000)
+    : 50_000;
+  const logs = [];
+  let cursor = fromBlock;
+  let chunk = initialChunk;
+  while (cursor <= toBlock) {
+    const end = Math.min(toBlock, cursor + chunk - 1);
+    try {
+      const [received, sent] = await Promise.all([
+        provider.getLogs({
+          address: positionManager,
+          fromBlock: cursor,
+          toBlock: end,
+          topics: [ERC721_TRANSFER_TOPIC, null, ownerTopic]
+        }),
+        provider.getLogs({
+          address: positionManager,
+          fromBlock: cursor,
+          toBlock: end,
+          topics: [ERC721_TRANSFER_TOPIC, ownerTopic, null]
+        })
+      ]);
+      logs.push(...received.map((log) => ({ log, direction: 'in' })));
+      logs.push(...sent.map((log) => ({ log, direction: 'out' })));
+      cursor = end + 1;
+      if (chunk < initialChunk) chunk = Math.min(initialChunk, chunk * 2);
+    } catch (error) {
+      if (chunk <= 1_000) throw error;
+      chunk = Math.max(1_000, Math.floor(chunk / 2));
+    }
+  }
+  return logs
+    .sort((left, right) => (
+      Number(left.log.blockNumber || 0) - Number(right.log.blockNumber || 0)
+      || Number(left.log.index ?? left.log.logIndex ?? 0)
+        - Number(right.log.index ?? right.log.logIndex ?? 0)
+    ))
+    .map(({ log, direction }) => ({
+      tokenId: positionTransferTokenId(log),
+      direction
+    }))
+    .filter((entry) => entry.tokenId);
+}
+
+async function scanOwnedPositionTransfersReliable(
+  provider,
+  positionManager,
+  owner,
+  fromBlock,
+  toBlock,
+  config
+) {
+  const errors = [];
+  const preferredUrls = (config.positionLogRpcUrls || []).filter(Boolean);
+  if (!preferredUrls.length) {
+    try {
+      return await scanOwnedPositionTransfers(
+        provider,
+        positionManager,
+        owner,
+        fromBlock,
+        toBlock,
+        config
+      );
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  const urls = [...new Set([
+    ...preferredUrls,
+    ...(config.rpcUrls || [])
+  ].filter(Boolean))];
+  for (const url of urls) {
+    const request = new ethers.FetchRequest(url);
+    request.timeout = Math.max(3_000, Number(config.rpcTimeoutMs) || 5_000);
+    const directProvider = new ethers.JsonRpcProvider(request, Number(CHAIN_ID), {
+      batchMaxCount: 1,
+      staticNetwork: true
+    });
+    try {
+      return await scanOwnedPositionTransfers(
+        directProvider,
+        positionManager,
+        owner,
+        fromBlock,
+        toBlock,
+        config
+      );
+    } catch (error) {
+      errors.push(`${url}: ${error.message}`);
+    } finally {
+      directProvider.destroy();
+    }
+  }
+  throw new Error(`仓位事件扫描失败：${errors.at(-1) || '所有 RPC 均不可用'}`);
+}
+
+async function discoverOwnedPositionIds(provider, config, owner, cache, seedIds = []) {
+  const headBlock = await provider.getBlockNumber();
+  if (!cache.initialized) {
+    cache.initialized = true;
+    cache.positionManager = ethers.getAddress(config.positionManager);
+    cache.ids = new Set(seedIds.map((id) => String(id)).filter((id) => /^\d+$/.test(id)));
+    const historyStart = configuredPositionScanStartBlock(config, headBlock);
+    const recentStart = configuredPositionInitialScanStartBlock(config, headBlock, historyStart);
+    cache.lastScannedBlock = recentStart - 1;
+    cache.historicalScanNextBlock = historyStart;
+    cache.historicalScanEndBlock = recentStart - 1;
+    if (!cache.ids.size) {
+      try {
+        const manager = new ethers.Contract(cache.positionManager, POSITION_ABI, provider);
+        const ownedCount = await manager.balanceOf(owner);
+        if (BigInt(ownedCount) === 0n) {
+          cache.lastScannedBlock = headBlock;
+          cache.recentScanDone = true;
+          cache.historicalScanNextBlock = cache.historicalScanEndBlock + 1;
+          cache.lastScanAt = Date.now();
+          return { ids: [], headBlock, error: null };
+        }
+      } catch {
+        // A non-enumerable or legacy manager can still be discovered from logs.
+      }
+    }
+  }
+  const scanInterval = Math.max(
+    1_000,
+    Number(config.positionScanIntervalMs) || DEFAULT_POSITION_SCAN_INTERVAL_MS
+  );
+  const now = Date.now();
+  if (now - Number(cache.lastScanAt || 0) < scanInterval) {
+    return { ids: [...cache.ids], headBlock, error: cache.scanError || null };
+  }
+  if (cache.scanInFlight) {
+    return { ids: [...cache.ids], headBlock, error: cache.scanError || null };
+  }
+
+  let scanPhase = 'forward';
+  let fromBlock = Number(cache.lastScannedBlock) + 1;
+  let toBlock = headBlock;
+  if (!cache.recentScanDone) {
+    // Limit the first scan to recent history. This catches newly minted active
+    // positions quickly without waiting for a genesis-to-head RPC scan.
+    scanPhase = 'recent';
+  } else if (Number.isSafeInteger(cache.historicalScanNextBlock)
+    && Number.isSafeInteger(cache.historicalScanEndBlock)
+    && cache.historicalScanNextBlock <= cache.historicalScanEndBlock
+    && now - Number(cache.lastHistoricalScanAt || 0) >= Math.max(
+      DEFAULT_POSITION_HISTORY_SCAN_INTERVAL_MS,
+      Number(config.positionHistoricalScanIntervalMs) || DEFAULT_POSITION_HISTORY_SCAN_INTERVAL_MS
+    )) {
+    // Periodically spend one scan on old history even while new blocks keep
+    // arriving. Without this cadence, a busy chain would keep the forward
+    // cursor moving forever and the historical backfill would never run.
+    scanPhase = 'historical';
+    cache.lastHistoricalScanAt = now;
+    fromBlock = cache.historicalScanNextBlock;
+    const configuredChunk = Number(config.positionScanChunkBlocks);
+    const chunk = Number.isSafeInteger(configuredChunk) && configuredChunk >= 1_000
+      ? Math.min(configuredChunk, 100_000)
+      : 50_000;
+    toBlock = Math.min(cache.historicalScanEndBlock, fromBlock + chunk - 1);
+  }
+  if (fromBlock > toBlock) {
+    cache.recentScanDone = true;
+    return { ids: [...cache.ids], headBlock, error: cache.scanError || null };
+  }
+  cache.scanInFlight = (async () => {
+    cache.lastScanAt = Date.now();
+    try {
+      let changes;
+      let scanRedirected = false;
+      try {
+        changes = await scanOwnedPositionTransfersReliable(
+          provider,
+          cache.positionManager,
+          owner,
+          fromBlock,
+          toBlock,
+          config
+        );
+      } catch (error) {
+        const fallbackStart = positionScanFallbackStartBlock(config, headBlock);
+        if (!isHistoricalBlockUnavailable(error) || fallbackStart <= fromBlock) throw error;
+
+        // Some public BSC RPCs cannot serve eth_getLogs from very old blocks
+        // and return "header not found". Keep seeded positions, then continue
+        // discovery from a recent window instead of surfacing a permanent UI
+        // error or retrying the unavailable genesis range every 5 seconds.
+        if (scanPhase === 'historical') {
+          // Skip the unavailable old range and let the next interval start a
+          // bounded backfill from the provider's earliest usable window.
+          cache.historicalScanNextBlock = fallbackStart;
+          cache.historicalScanEndBlock = headBlock;
+          scanRedirected = true;
+          changes = [];
+        } else {
+          cache.lastScannedBlock = fallbackStart - 1;
+          changes = await scanOwnedPositionTransfersReliable(
+            provider,
+            cache.positionManager,
+            owner,
+            fallbackStart,
+            headBlock,
+            config
+          );
+        }
+      }
+      for (const change of changes) {
+        if (change.direction === 'in') cache.ids.add(change.tokenId);
+        else cache.ids.delete(change.tokenId);
+      }
+      if (scanPhase === 'recent') {
+        cache.lastScannedBlock = toBlock;
+        cache.recentScanDone = true;
+      } else if (scanPhase === 'historical' && !scanRedirected) {
+        cache.historicalScanNextBlock = toBlock + 1;
+      } else {
+        cache.lastScannedBlock = toBlock;
+      }
+      cache.scanError = null;
+    } catch (error) {
+      cache.scanError = error.message;
+      // Do not repeat a failed historical scan on every UI request.
+    } finally {
+      cache.scanInFlight = null;
+    }
+    return { ids: [...cache.ids], headBlock, error: cache.scanError || null };
+  })();
+  return cache.scanInFlight;
 }
 
 export function normalizeManagementInput(body, config) {
@@ -1058,6 +1679,7 @@ function finalizeCleanupRecovery(action) {
 export function createLiquidityManagementRouter({
   configPath,
   actionPath,
+  liquidityActionPath = null,
   environment = process.env,
   executionConflict = () => null
 }) {
@@ -1066,9 +1688,203 @@ export function createLiquidityManagementRouter({
   let readySettled = false;
   let readyError = null;
   let lastAction = null;
+  let liquidityAction = null;
+  let actionHistory = [];
+  const historyPath = `${actionPath}.history.json`;
+  const invalidPositionPath = `${actionPath}.invalid.json`;
+  let invalidPositionIds = new Set();
   const authorizations = new Map();
+  const ownedPositionCaches = new Map();
+
+  function ownedPositionCache(owner) {
+    const key = ethers.getAddress(owner).toLowerCase();
+    if (!ownedPositionCaches.has(key)) {
+      ownedPositionCaches.set(key, {
+        initialized: false,
+        ids: new Set(),
+        emptyIds: new Set(),
+        lastEmptyCheckAt: 0,
+        positions: [],
+        positionErrors: [],
+        updatedAt: null,
+        refreshInFlight: null,
+        lastRefreshAt: 0,
+        discoveryInFlight: null,
+        recentScanDone: false,
+        lastHistoricalScanAt: 0,
+        historicalScanNextBlock: null,
+        historicalScanEndBlock: null,
+        discovery: {
+          scanning: false,
+          lastScanAt: null,
+          error: null
+        }
+      });
+    }
+    return ownedPositionCaches.get(key);
+  }
+
+  function seedOwnedPositionIds(additionalAction = null) {
+    return [
+      lastAction?.nftId,
+      liquidityAction?.nftId,
+      additionalAction?.nftId,
+      ...actionHistory.map((action) => action?.nftId)
+    ]
+      .map((value) => String(value || ''))
+      .filter((value, index, values) => /^\d+$/.test(value) && values.indexOf(value) === index);
+  }
+
+  function startOwnedPositionDiscovery(config, owner, cache, seedIds) {
+    if (cache.discoveryInFlight) return;
+    cache.discovery.scanning = true;
+    cache.discoveryInFlight = (async () => {
+      let provider;
+      try {
+        provider = await openProvider(config);
+        const discovered = await discoverOwnedPositionIds(
+          provider,
+          config,
+          owner,
+          cache,
+          seedIds
+        );
+        cache.discovery.lastScanAt = new Date().toISOString();
+        cache.discovery.error = discovered.error || null;
+      } catch (error) {
+        cache.discovery.error = error.message;
+      } finally {
+        cache.discovery.scanning = false;
+        cache.discoveryInFlight = null;
+        provider?.destroy();
+      }
+    })();
+    // Discovery is deliberately detached from the HTTP response. Any error is
+    // retained in cache.discovery and surfaced by the next polling response.
+    cache.discoveryInFlight.catch(() => {});
+  }
+
+  async function refreshOwnedPositions(config, owner) {
+    const cache = ownedPositionCache(owner);
+    const refreshInterval = Math.max(
+      DEFAULT_POSITION_REFRESH_MS,
+      Number(config.positionRefreshIntervalMs) || DEFAULT_POSITION_REFRESH_MS
+    );
+    if (cache.updatedAt && Date.now() - cache.lastRefreshAt < refreshInterval) {
+      return cache;
+    }
+    if (cache.refreshInFlight) return cache.refreshInFlight;
+    cache.refreshInFlight = (async () => {
+      let provider;
+      try {
+        provider = await openProvider(config);
+        // The initialization router can create a new NFT after this router
+        // was started. Refresh the latest action file so that the new NFT is
+        // available immediately, even if historical Transfer-log discovery
+        // is delayed by an RPC provider.
+        let latestLiquidityAction = null;
+        if (liquidityActionPath) {
+          try {
+            latestLiquidityAction = await readJson(liquidityActionPath);
+            liquidityAction = latestLiquidityAction;
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+          }
+        }
+        const seedIds = seedOwnedPositionIds(latestLiquidityAction);
+        for (const seedId of seedIds) cache.ids.add(seedId);
+        // Never make the page wait for eth_getLogs. Validate known IDs now and
+        // discover additional positions in the background; the 1.5s browser
+        // poll picks up newly found IDs on the next response.
+        startOwnedPositionDiscovery(config, owner, cache, seedIds);
+        const ids = [...cache.ids].sort((left, right) => (
+            BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+          ));
+        const idSet = new Set(ids);
+        for (const emptyId of cache.emptyIds) {
+          if (!idSet.has(emptyId) || invalidPositionIds.has(emptyId)) cache.emptyIds.delete(emptyId);
+        }
+        const emptyCheckInterval = Math.max(
+          30_000,
+          Number(config.positionEmptyRefreshIntervalMs) || 30_000
+        );
+        const shouldRecheckEmpty = Date.now() - cache.lastEmptyCheckAt >= emptyCheckInterval;
+        const idsToRead = ids.filter((id) => (
+          !cache.emptyIds.has(String(id)) || shouldRecheckEmpty
+        ));
+        if (shouldRecheckEmpty) cache.lastEmptyCheckAt = Date.now();
+        const previous = new Map(cache.positions.map((position) => [String(position.nftId), position]));
+        const results = [];
+        let invalidListChanged = false;
+        const positionBatchSize = 8;
+        for (let offset = 0; offset < idsToRead.length; offset += positionBatchSize) {
+          const batch = idsToRead.slice(offset, offset + positionBatchSize);
+          results.push(...await Promise.allSettled(batch.map((nftId) => (
+            readPosition(provider, config, nftId, owner)
+              .then(publicPosition)
+          ))));
+        }
+        cache.positionErrors = [];
+        cache.positions = results.flatMap((result, index) => {
+          const nftId = idsToRead[index];
+          if (result.status === 'fulfilled') {
+            if (String(result.value.liquidity) === '0') {
+              cache.emptyIds.add(String(nftId));
+              return [];
+            }
+            cache.emptyIds.delete(String(nftId));
+            if (invalidPositionIds.delete(String(nftId))) invalidListChanged = true;
+            return [result.value];
+          }
+          cache.positionErrors.push({ nftId, error: result.reason?.message || '读取仓位失败' });
+          const stale = previous.get(String(nftId));
+          return stale && String(stale.liquidity) !== '0' ? [stale] : [];
+        });
+        if (invalidListChanged) {
+          await writeJsonAtomic(invalidPositionPath, [...invalidPositionIds].sort((left, right) => (
+            BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+          )));
+        }
+        cache.updatedAt = new Date().toISOString();
+        cache.lastRefreshAt = Date.now();
+        return cache;
+      } catch (error) {
+        cache.discovery.scanning = false;
+        cache.discovery.error = error.message;
+        cache.updatedAt ||= new Date().toISOString();
+        cache.lastRefreshAt = Date.now();
+        return cache;
+      } finally {
+        cache.refreshInFlight = null;
+        provider?.destroy();
+      }
+    })();
+    return cache.refreshInFlight;
+  }
   const ready = (async () => {
     try {
+      try {
+        const storedInvalid = await readJson(invalidPositionPath);
+        const storedIds = Array.isArray(storedInvalid) ? storedInvalid : storedInvalid?.ids;
+        invalidPositionIds = new Set((storedIds || [])
+          .map((id) => String(id))
+          .filter((id) => /^\d+$/.test(id)));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      try {
+        const storedHistory = await readJson(historyPath);
+        actionHistory = Array.isArray(storedHistory) ? storedHistory : [];
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (liquidityActionPath) {
+        try {
+          liquidityAction = await readJson(liquidityActionPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
       lastAction = await readJson(actionPath);
       if (lastAction.cleanupTx?.hash) {
         lastAction.currentTx ||= lastAction.cleanupTx;
@@ -1097,6 +1913,8 @@ export function createLiquidityManagementRouter({
         lastAction.failedAt ||= new Date().toISOString();
         await writeJsonAtomic(actionPath, lastAction);
       }
+      actionHistory = updateManagementActionHistory(actionHistory, lastAction);
+      await writeJsonAtomic(historyPath, actionHistory);
     } catch (error) {
       if (error.code !== 'ENOENT') {
         readyError = error;
@@ -1109,6 +1927,10 @@ export function createLiquidityManagementRouter({
   const persist = async (action) => {
     lastAction = action;
     await writeJsonAtomic(actionPath, action);
+    if (TERMINAL_STAGES.has(action.stage) || action.stage === 'needs_attention') {
+      actionHistory = updateManagementActionHistory(actionHistory, action);
+      await writeJsonAtomic(historyPath, actionHistory);
+    }
   };
 
   router.get('/options', async (_req, res) => {
@@ -1131,7 +1953,8 @@ export function createLiquidityManagementRouter({
         autoSwapConfigured: okxCredentialsConfigured(environment),
         maxStableBudget: Number(config.maxStableBudget ?? 1000),
         inFlight,
-        lastAction: publicAction(lastAction)
+        lastAction: publicAction(lastAction),
+        actionHistory
       });
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -1142,9 +1965,99 @@ export function createLiquidityManagementRouter({
     try {
       await ready;
       res.set('Cache-Control', 'no-store');
-      res.json({ inFlight, lastAction: publicAction(lastAction) });
+      res.json({ inFlight, lastAction: publicAction(lastAction), actionHistory });
     } catch (error) {
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  const handleOwnedPositions = async (_req, res) => {
+    try {
+      await ready;
+      res.set('Cache-Control', 'no-store');
+      if (!environment.PRIVATE_KEY) {
+        res.json({
+          walletAddress: null,
+          positions: [],
+          positionCount: 0,
+          updatedAt: null,
+          pollIntervalMs: DEFAULT_POSITION_REFRESH_MS,
+          discovery: { scanning: false, error: '缺少 PRIVATE_KEY' }
+        });
+        return;
+      }
+      const config = await readJson(configPath);
+      const owner = new ethers.Wallet(environment.PRIVATE_KEY).address;
+      const cache = await refreshOwnedPositions(config, owner);
+      res.json({
+        walletAddress: owner,
+        positions: cache.positions,
+        positionCount: cache.positions.length,
+        updatedAt: cache.updatedAt,
+        pollIntervalMs: DEFAULT_POSITION_REFRESH_MS,
+        stale: Boolean(cache.refreshInFlight),
+        discovery: {
+          scanning: Boolean(cache.discovery.scanning || cache.refreshInFlight),
+          lastScanAt: cache.discovery.lastScanAt,
+          error: cache.discovery.error,
+          emptyPositionCount: cache.emptyIds.size,
+          positionErrors: cache.positionErrors
+        }
+      });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  };
+
+  // Keep the canonical endpoint and a compatibility alias while older browser
+  // bundles or rolling server instances are still in circulation.
+  router.get('/positions', handleOwnedPositions);
+  router.get('/position-list', handleOwnedPositions);
+
+  router.post('/cleanup-invalid', async (req, res) => {
+    let provider;
+    let lockAcquired = false;
+    try {
+      await ready;
+      if (req.body.confirmed !== true) throw new Error('必须确认清理无效策略');
+      if (!environment.PRIVATE_KEY) throw new Error('缺少 PRIVATE_KEY');
+      if (inFlight) throw new Error('已有仓位任务正在执行');
+      const conflict = executionConflict();
+      if (conflict) throw new Error(conflict);
+      const ids = [...new Set((Array.isArray(req.body.nftIds) ? req.body.nftIds : [])
+        .map((id) => String(id || '').trim())
+        .filter((id) => /^\d+$/.test(id)))];
+      if (!ids.length) throw new Error('没有可清理的无效策略');
+      if (ids.length > 50) throw new Error('单次最多清理 50 个无效策略');
+
+      inFlight = true;
+      lockAcquired = true;
+      const config = await readJson(configPath);
+      const wallet = new ethers.Wallet(environment.PRIVATE_KEY);
+      provider = await openProvider(config);
+      const verified = [];
+      for (const nftId of ids) {
+        const position = await readPosition(provider, config, nftId, wallet.address);
+        if (position.liquidity !== 0n) {
+          throw new Error(`NFT #${nftId} 仍有流动性，不能标记为无效策略`);
+        }
+        verified.push(nftId);
+      }
+
+      invalidPositionIds = new Set([...invalidPositionIds, ...verified]);
+      await writeJsonAtomic(invalidPositionPath, [...invalidPositionIds].sort((left, right) => (
+        BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+      )));
+      for (const cache of ownedPositionCaches.values()) {
+        for (const nftId of verified) cache.ids.delete(nftId);
+        cache.positions = cache.positions.filter((position) => !verified.includes(String(position.nftId)));
+      }
+      res.json({ cleaned: verified, invalidPositionIds: [...invalidPositionIds] });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    } finally {
+      if (lockAcquired) inFlight = false;
+      provider?.destroy();
     }
   });
 

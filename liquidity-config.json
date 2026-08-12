@@ -38,6 +38,18 @@
     "https://bsc.api.pocket.network"
   ],
   "rpcTimeoutMs": 5000,
+  "positionLogRpcUrls": [
+    "https://bsc.api.pocket.network",
+    "https://bsc-dataseed.bnbchain.org"
+  ],
+  "positionScanStartBlock": 0,
+  "positionScanWindowBlocks": 3000000,
+  "positionScanChunkBlocks": 50000,
+  "positionInitialScanWindowBlocks": 10000,
+  "positionScanIntervalMs": 5000,
+  "positionHistoricalScanIntervalMs": 30000,
+  "positionRefreshIntervalMs": 1500,
+  "positionEmptyRefreshIntervalMs": 30000,
   "okxRequestTimeoutMs": 8000,
   "okxRequestAttempts": 2,
   "transactionTimeoutMs": 90000,

@@ -4,5 +4,11 @@ node_modules/
 .guard-action.json.tmp
 .liquidity-action.json
 .liquidity-action.json.tmp
+.liquidity-management-action.json
+.liquidity-management-action.json.tmp
+.liquidity-management-action.json.history.json
+.liquidity-management-action.json.history.json.tmp
+.liquidity-management-action.json.invalid.json
+.liquidity-management-action.json.invalid.json.tmp
 config.json.tmp
 npm-debug.log*

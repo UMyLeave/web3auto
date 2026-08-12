@@ -1,4 +1,5 @@
 const API_ROOT = '/api/liquidity-management';
+const POSITION_POLL_INTERVAL_MS = 1500;
 const TERMINAL_STAGES = new Set(['completed', 'failed', 'cancelled']);
 const OPERATION_META = {
   increase: {
@@ -24,17 +25,25 @@ const OPERATION_META = {
 };
 
 const panel = document.querySelector('#liquidityManagePanel');
-const createPanel = document.querySelector('#liquidityCreatePanel');
-const tabButtons = [...document.querySelectorAll('[data-liquidity-tab]')];
+const createModal = document.querySelector('#liquidityCreateModal');
 
 const state = {
   options: null,
+  positions: [],
   position: null,
+  selectedNftId: null,
   operation: 'increase',
   budgetPreset: '10',
   busy: false,
+  modalOpen: false,
+  recordsOpen: false,
+  confirmResolver: null,
   status: null,
+  actionHistory: [],
   pollTimer: null,
+  positionPollTimer: null,
+  positionPollInFlight: false,
+  positionPollStopped: false,
   loaded: false
 };
 
@@ -61,18 +70,19 @@ function compactNumber(value, digits = 6) {
   return number.toLocaleString('zh-CN', { maximumFractionDigits: digits });
 }
 
-function formatRaw(value, decimals) {
-  if (value === null || value === undefined) return '—';
-  try {
-    const negative = BigInt(value) < 0n;
-    const amount = negative ? -BigInt(value) : BigInt(value);
-    const scale = 10n ** BigInt(decimals);
-    const whole = amount / scale;
-    const fraction = (amount % scale).toString().padStart(decimals, '0').replace(/0+$/, '').slice(0, 6);
-    return `${negative ? '-' : ''}${whole.toLocaleString('en-US')}${fraction ? `.${fraction}` : ''}`;
-  } catch {
-    return String(value);
+function precisePrice(value, significantDigits = 9) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value ?? '—');
+  if (number === 0) return '0';
+  const absolute = Math.abs(number);
+  if (absolute >= 1) {
+    return number.toLocaleString('zh-CN', { maximumFractionDigits: 8 });
   }
+  if (absolute < 1e-18) return number.toExponential(8);
+  const leadingZeros = Math.max(0, Math.floor(-Math.log10(absolute)) - 1);
+  return number.toFixed(Math.min(18, leadingZeros + significantDigits))
+    .replace(/0+$/, '')
+    .replace(/\.$/, '');
 }
 
 async function request(path, requestOptions = {}) {
@@ -84,6 +94,7 @@ async function request(path, requestOptions = {}) {
   if (!response.ok) {
     const error = new Error(data.error || `请求失败 (${response.status})`);
     error.data = data;
+    error.status = response.status;
     throw error;
   }
   return data;
@@ -106,152 +117,492 @@ function showToast(message, type = 'success') {
   }, 3200);
 }
 
-function switchTab(name, updateHash = true) {
-  const managing = name === 'manage';
-  createPanel.hidden = managing;
-  panel.hidden = !managing;
-  for (const button of tabButtons) {
-    const active = button.dataset.liquidityTab === name;
-    button.classList.toggle('active', active);
-    button.setAttribute('aria-selected', String(active));
-  }
-  if (updateHash) history.replaceState(null, '', managing ? '#manage' : '#create');
-  if (managing && !state.loaded) loadManagement();
+function openCreateModal() {
+  if (!createModal) return;
+  createModal.hidden = false;
+  panel.querySelector('#lmOpenCreateButton')?.setAttribute('aria-expanded', 'true');
+  syncModalState();
+  window.dispatchEvent(new CustomEvent('liquidity:open-create'));
+  window.setTimeout(() => createModal.querySelector('#tradeToken')?.focus(), 0);
+}
+
+function closeCreateModal() {
+  if (!createModal) return;
+  // The form remains mounted, and the form snapshot restores inputs on the next
+  // open. Failed execution is never auto-closed.
+  createModal.hidden = true;
+  panel.querySelector('#lmOpenCreateButton')?.setAttribute('aria-expanded', 'false');
+  syncModalState();
 }
 
 function renderShell() {
   panel.innerHTML = `
-    <div class="lm-layout">
-      <section class="liquidity-card lm-main-card">
-        <div class="lm-section lm-position-search">
-          <div class="section-label">
-            <span>选择已有仓位</span>
-            <small>仅允许管理当前执行钱包持有的 NFT</small>
-          </div>
-          <form id="lmPositionForm" class="lm-search-row">
-            <label class="liquidity-field" for="lmNftId">
-              <span>Uniswap v4 NFT ID</span>
-              <input id="lmNftId" inputmode="numeric" autocomplete="off" placeholder="例如 12345">
-            </label>
-            <button id="lmLoadPosition" class="secondary-button" type="submit">读取仓位</button>
-          </form>
-          <div id="lmPositionCard" class="lm-position-empty">输入 NFT ID 后读取币对、区间和当前流动性。</div>
+    <div class="lm-workspace">
+      <div class="lm-management-toolbar">
+        <div class="lm-toolbar-actions">
+          <button id="lmClearInvalidButton" class="secondary-button" type="button" hidden>
+            清空无效策略
+          </button>
+          <button id="lmOpenCreateButton" class="primary-button" type="button"
+            aria-controls="liquidityCreateModal" aria-haspopup="dialog" aria-expanded="false">
+            <span aria-hidden="true">＋</span> 初始化流动性
+          </button>
         </div>
+      </div>
 
-        <div id="lmOperations" class="lm-section lm-operation-section">
-          <div class="section-label">
+      <div class="lm-poll-status" aria-live="polite">
+        <i></i><span id="lmPollStatusText">正在发现当前钱包策略…</span>
+      </div>
+      <div id="lmPositionCard" class="lm-position-list">
+        <div class="lm-position-empty">正在读取当前钱包的策略仓位…</div>
+      </div>
+      <p id="lmMessage" class="lm-message" aria-live="polite"></p>
+
+    </div>
+
+    <div id="lmOperationModal" class="lm-modal" role="dialog" aria-modal="true"
+      aria-labelledby="lmModalTitle" hidden>
+      <div class="lm-modal-backdrop" data-lm-close-operation></div>
+      <section class="lm-modal-card">
+        <header class="lm-modal-heading">
+          <div>
             <span>仓位操作</span>
-            <small>所有操作均沿用当前 NFT，不销毁空仓 NFT</small>
+            <strong id="lmModalTitle">补仓</strong>
           </div>
-          <div class="lm-operation-tabs" role="tablist" aria-label="仓位操作">
-            ${Object.entries(OPERATION_META).map(([key, item]) => `
-              <button type="button" class="lm-operation-tab${key === state.operation ? ' active' : ''}"
-                data-lm-operation="${key}" role="tab" aria-selected="${key === state.operation}">
-                ${item.label}
-              </button>
-            `).join('')}
-          </div>
-          <div id="lmOperationBody" class="lm-operation-body"></div>
-          <div class="lm-action-row">
-            <button id="lmActionButton" class="primary-button" type="button" disabled>继续补仓</button>
-          </div>
-          <p id="lmMessage" class="lm-message" aria-live="polite"></p>
+          <button id="lmModalClose" type="button" aria-label="关闭操作窗口">×</button>
+        </header>
+        <div id="lmOperationBody" class="lm-operation-body"></div>
+        <div id="lmModalSummary" class="lm-modal-summary" hidden></div>
+        <div class="lm-action-row">
+          <button id="lmActionButton" class="primary-button" type="button" disabled>继续补仓</button>
         </div>
       </section>
+    </div>
 
-      <aside class="lm-summary-column">
-        <section class="liquidity-card lm-summary-card">
-          <div class="summary-heading">
-            <div>
-              <span>操作摘要</span>
-              <small>点击操作后自动核对链上状态</small>
-            </div>
-            <span id="lmSummaryBadge" class="summary-badge">待操作</span>
+    <div id="lmRecordsModal" class="lm-modal" role="dialog" aria-modal="true"
+      aria-labelledby="lmRecordsTitle" hidden>
+      <div class="lm-modal-backdrop" data-lm-close-records></div>
+      <section class="lm-modal-card lm-records-card">
+        <header class="lm-modal-heading">
+          <div>
+            <span>策略仓位</span>
+            <strong id="lmRecordsTitle">操作记录</strong>
           </div>
-          <div id="lmSummary" class="lm-summary-empty">
-            读取仓位并选择操作后，这里会显示预计结果和链上执行状态。
-          </div>
-          <div id="lmRecovery" class="lm-recovery" hidden></div>
-        </section>
+          <button id="lmRecordsClose" type="button" aria-label="关闭操作记录">×</button>
+        </header>
+        <div id="lmRecordsBody" class="lm-records-body"></div>
+      </section>
+    </div>
 
-        <section class="liquidity-card lm-rules-card">
-          <strong>执行规则</strong>
-          <ul>
-            <li>补仓自动 Zap In，固定沿用 NFT 原 Tick 区间</li>
-            <li>撤出流动性固定 100%，双币到账且不兑换</li>
-            <li>减仓按比例撤出，交易代币与稳定币双币到账且不兑换</li>
-            <li>紧急撤退固定 100%，本次代币 Zap Out 为稳定币</li>
-            <li>撤出成功但兑换失败时，只允许重试兑换，不重复撤出</li>
-          </ul>
-        </section>
-      </aside>
+    <div id="lmConfirmModal" class="lm-modal lm-confirm-modal" role="alertdialog" aria-modal="true"
+      aria-labelledby="lmConfirmTitle" aria-describedby="lmConfirmMessage" hidden>
+      <div class="lm-modal-backdrop" data-lm-cancel-confirm></div>
+      <section class="lm-modal-card lm-confirm-card">
+        <header class="lm-modal-heading">
+          <div>
+            <span>请确认</span>
+            <strong id="lmConfirmTitle">确认操作</strong>
+          </div>
+        </header>
+        <p id="lmConfirmMessage" class="lm-confirm-message"></p>
+        <div class="lm-confirm-actions">
+          <button id="lmConfirmCancel" class="secondary-button" type="button">取消</button>
+          <button id="lmConfirmAccept" class="primary-button" type="button">确认</button>
+        </div>
+      </section>
     </div>
   `;
 }
 
-function positionRange(position) {
-  try {
-    const tradeIsCurrency0 = !position.token0.isStablecoin;
-    const tradeDecimals = tradeIsCurrency0 ? position.token0.decimals : position.token1.decimals;
-    const stableDecimals = tradeIsCurrency0 ? position.token1.decimals : position.token0.decimals;
-    const scale = 10 ** (tradeDecimals - stableDecimals);
-    const priceAtTick = (tick) => {
-      const raw = 1.0001 ** tick;
-      return tradeIsCurrency0 ? raw * scale : scale / raw;
-    };
-    const prices = [priceAtTick(position.tickLower), priceAtTick(position.tickUpper)].sort((a, b) => a - b);
-    return `${compactNumber(prices[0])} – ${compactNumber(prices[1])} ${position.stablecoin.symbol}`;
-  } catch {
-    return `Tick ${position.tickLower} – ${position.tickUpper}`;
+function clampPercent(value) {
+  return Math.max(0, Math.min(100, Number(value) || 0));
+}
+
+function tokenValueShare(position) {
+  const price = Number(position.activePrice);
+  const amount0 = Number(position.token0.amount);
+  const amount1 = Number(position.token1.amount);
+  if (![price, amount0, amount1].every(Number.isFinite) || price <= 0) return 50;
+  const value0 = position.token0.isStablecoin ? amount0 : amount0 * price;
+  const value1 = position.token1.isStablecoin ? amount1 : amount1 * price;
+  const total = value0 + value1;
+  return total > 0 ? clampPercent(value0 * 100 / total) : 50;
+}
+
+function fallbackPriceRange(position) {
+  const lowerTick = Number(position.tickLower);
+  const upperTick = Number(position.tickUpper);
+  const currentTick = Number(position.currentTick);
+  const spacing = Math.abs(Number(position.poolKey?.tickSpacing));
+  const currentPrice = Number(position.activePrice);
+  const tradeIsCurrency0 = !position.token0?.isStablecoin;
+  const tradeDecimals = Number((tradeIsCurrency0 ? position.token0 : position.token1)?.decimals);
+  const stableDecimals = Number((tradeIsCurrency0 ? position.token1 : position.token0)?.decimals);
+  if (![lowerTick, upperTick, currentTick, spacing, currentPrice, tradeDecimals, stableDecimals]
+    .every(Number.isFinite)
+    || spacing <= 0 || currentPrice <= 0 || upperTick <= lowerTick
+    || !position.stablecoin || !position.tradeToken) {
+    return null;
   }
+  const scale = 10 ** (tradeDecimals - stableDecimals);
+  const priceAtTick = (tick) => {
+    const rawPrice = 1.0001 ** tick;
+    return tradeIsCurrency0 ? rawPrice * scale : scale / rawPrice;
+  };
+  const prices = [priceAtTick(lowerTick), priceAtTick(upperTick)].sort((left, right) => left - right);
+  if (!prices.every((price) => Number.isFinite(price) && price > 0)) return null;
+  const gridCount = Math.max(1, Math.round((upperTick - lowerTick) / spacing));
+  const rawGrid = tradeIsCurrency0
+    ? Math.floor((currentTick - lowerTick) / spacing)
+    : Math.floor((upperTick - currentTick) / spacing);
+  const rawPosition = tradeIsCurrency0
+    ? (currentTick - lowerTick) / (upperTick - lowerTick)
+    : (upperTick - currentTick) / (upperTick - lowerTick);
+  const rangeState = currentPrice < prices[0]
+    ? 'below'
+    : currentPrice > prices[1] ? 'above' : 'inside';
+  const distancePercent = rangeState === 'below'
+    ? (prices[0] - currentPrice) * 100 / currentPrice
+    : rangeState === 'above'
+      ? (currentPrice - prices[1]) * 100 / currentPrice
+      : 0;
+  return {
+    lowerPrice: String(prices[0]),
+    currentPrice: String(position.activePrice),
+    upperPrice: String(prices[1]),
+    rangeWidthPercent: ((prices[1] - prices[0]) * 100 / currentPrice).toFixed(2),
+    gridCount,
+    currentGrid: rangeState === 'below'
+      ? 0
+      : rangeState === 'above' ? gridCount + 1 : Math.max(0, Math.min(gridCount, rawGrid)),
+    positionPercent: rawPosition * 100,
+    rangeState,
+    distancePercent: distancePercent.toFixed(2)
+  };
+}
+
+function operationIcon(operation) {
+  const icons = {
+    increase: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>',
+    reduce: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>',
+    withdraw: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h5v16h-5M3 12h11M10 8l4 4-4 4"/></svg>',
+    emergency: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.3 3.6 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>',
+    records: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
+    copy: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
+    cleanup: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></svg>'
+  };
+  return icons[operation] || '';
+}
+
+function actionTimestamp(action) {
+  return action?.completedAt || action?.failedAt || action?.startedAt || '';
+}
+
+function actionTimeValue(action) {
+  const value = Date.parse(actionTimestamp(action));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function mergeActionRecord(action) {
+  if (!action?.id) return;
+  const record = {
+    id: action.id,
+    operation: action.operation,
+    nftId: String(action.nftId),
+    stage: action.stage,
+    startedAt: action.startedAt || null,
+    completedAt: action.completedAt || null,
+    failedAt: action.failedAt || null,
+    finalLiquidity: action.finalLiquidity ?? null,
+    error: action.error || null
+  };
+  state.actionHistory = [
+    record,
+    ...state.actionHistory.filter((item) => item?.id !== record.id)
+  ].slice(0, 50);
+}
+
+function positionActionRecords(position = state.position) {
+  if (!position) return [];
+  const records = [...state.actionHistory];
+  if (state.status?.lastAction?.id) records.unshift(state.status.lastAction);
+  const seen = new Set();
+  return records
+    .filter((action) => String(action?.nftId) === String(position.nftId))
+    .filter((action) => {
+      if (!action?.id || seen.has(action.id)) return false;
+      seen.add(action.id);
+      return true;
+    })
+    .sort((left, right) => actionTimeValue(right) - actionTimeValue(left));
+}
+
+function isEmergencyRetired(position = state.position) {
+  if (!position || String(position.liquidity) !== '0') return false;
+  const latestCompleted = positionActionRecords(position)
+    .find((action) => action.stage === 'completed');
+  return latestCompleted?.operation === 'emergency'
+    && String(latestCompleted.finalLiquidity) === '0';
+}
+
+function isEmptyLiquidity(position) {
+  return String(position?.liquidity) === '0';
+}
+
+function isInvalidStrategy(position) {
+  // Any strategy without liquidity is stale from the management view, even
+  // when it reached zero through an emergency withdrawal. Keep the card and
+  // its operation history visible until the user explicitly clears it.
+  return isEmptyLiquidity(position);
+}
+
+function invalidStrategies() {
+  return state.positions.filter(isInvalidStrategy);
+}
+
+function refreshInvalidCleanupButton() {
+  const button = panel.querySelector('#lmClearInvalidButton');
+  if (!button) return;
+  const count = invalidStrategies().length;
+  button.hidden = count === 0;
+  button.disabled = state.busy || Boolean(state.status?.inFlight) || count === 0;
+  button.textContent = count ? `清空无效策略（${count}）` : '清空无效策略';
+}
+
+function refreshPositionActions() {
+  const taskIssue = state.busy || state.status?.inFlight
+    ? '当前有链上任务待完成'
+    : state.status?.lastAction?.stage === 'needs_attention'
+      ? '请先处理上一次未完成任务'
+      : '';
+  for (const button of panel.querySelectorAll('[data-lm-open-operation]')) {
+    const card = button.closest('[data-lm-position-card]');
+    const position = state.positions.find((item) => (
+      String(item.nftId) === String(card?.dataset.nftId)
+    ));
+    const positionIssue = position && !position.supported
+      ? position.unsupportedReason || '当前仓位不受支持'
+      : isEmptyLiquidity(position)
+        ? '当前仓位没有流动性，请先清理无效策略'
+      : '';
+    const disabledReason = positionIssue || taskIssue;
+    button.disabled = Boolean(disabledReason);
+    button.dataset.tooltip = disabledReason || button.getAttribute('aria-label') || '';
+  }
+  for (const button of panel.querySelectorAll('[data-lm-clean-invalid]')) {
+    button.disabled = state.busy || Boolean(state.status?.inFlight);
+  }
+}
+
+function bindPositionActions() {
+  for (const button of panel.querySelectorAll('[data-lm-open-operation]')) {
+    button.addEventListener('click', () => {
+      const card = button.closest('[data-lm-position-card]');
+      openOperation(button.dataset.lmOpenOperation, card?.dataset.nftId);
+    });
+  }
+  for (const button of panel.querySelectorAll('[data-lm-open-records]')) {
+    button.addEventListener('click', () => {
+      const card = button.closest('[data-lm-position-card]');
+      selectPosition(card?.dataset.nftId);
+      openRecords();
+    });
+  }
+  for (const button of panel.querySelectorAll('[data-lm-copy]')) {
+    button.addEventListener('click', () => {
+      copyPositionValue(button.dataset.lmCopy, button.dataset.copyLabel || '内容');
+    });
+  }
+  for (const button of panel.querySelectorAll('[data-lm-clean-invalid]')) {
+    button.addEventListener('click', () => {
+      cleanupInvalidStrategies([button.closest('[data-lm-position-card]')?.dataset.nftId]);
+    });
+  }
+  refreshPositionActions();
+}
+
+async function copyPositionValue(value, label) {
+  if (!value) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const input = document.createElement('textarea');
+      input.value = value;
+      input.setAttribute('readonly', 'true');
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand('copy');
+      input.remove();
+    }
+    showToast(`${label}已复制`);
+  } catch (error) {
+    showToast(`复制失败：${error.message}`, 'error');
+  }
+}
+
+function selectPosition(nftId) {
+  const position = state.positions.find((item) => String(item.nftId) === String(nftId));
+  if (!position) return null;
+  state.selectedNftId = String(position.nftId);
+  state.position = position;
+  return position;
+}
+
+function positionCardMarkup(position) {
+  const value = position.valueInStablecoin
+    ? `≈ ${compactNumber(position.valueInStablecoin.formatted, 4)} ${position.valueInStablecoin.symbol}`
+    : '暂不支持估值';
+  const token0Share = tokenValueShare(position);
+  const range = position.priceRange || fallbackPriceRange(position);
+  const retired = isEmergencyRetired(position);
+  const emptyLiquidity = isEmptyLiquidity(position);
+  const invalid = isInvalidStrategy(position);
+  const rangeState = range?.rangeState || (position.inRange
+    ? 'inside'
+    : Number(range?.currentPrice) < Number(range?.lowerPrice) ? 'below' : 'above');
+  const currentPricePosition = range
+    ? rangeState === 'below' ? 3 : rangeState === 'above' ? 97 : 8 + clampPercent(range.positionPercent) * 0.84
+    : 50;
+  const rangeStatusText = rangeState === 'below'
+    ? `低于下限 ${escapeHtml(range.distancePercent || '0.00')}%`
+    : rangeState === 'above'
+      ? `高于上限 ${escapeHtml(range.distancePercent || '0.00')}%`
+      : '价格在范围内';
+  const tokenAmountMarkup = (token, className) => {
+    const fee = token.uncollectedFee;
+    return `<strong>${escapeHtml(compactNumber(token.amount))}${fee === null || fee === undefined
+      ? '<small class="lm-fee-pending">（手续费读取中）</small>'
+      : `<small class="lm-token-fee">(+${escapeHtml(compactNumber(fee))})</small>`}</strong>`;
+  };
+  const rangeMarkup = range ? `
+    <div class="lm-price-range">
+      <div class="lm-price-heading">
+        <span>价格区间（${escapeHtml(position.stablecoin.symbol)}/${escapeHtml(position.tradeToken.symbol)} ${escapeHtml(range.gridCount)} 格）</span>
+        <strong>${escapeHtml(range.rangeWidthPercent)}%</strong>
+      </div>
+      <div class="lm-price-track-wrap${emptyLiquidity ? ' is-empty' : ''}">
+        <div class="lm-price-track" aria-hidden="true">
+          <span class="lm-price-lower-bound"></span>
+          <span class="lm-price-upper-bound"></span>
+          ${retired || emptyLiquidity ? '' : `<i class="lm-current-price ${rangeState === 'inside' ? '' : 'is-outside'}" style="left:${currentPricePosition}%">
+            <b>${escapeHtml(precisePrice(range.currentPrice))}</b>
+          </i>`}
+        </div>
+        <div class="lm-price-labels">
+          <span><b>${escapeHtml(precisePrice(range.lowerPrice))}</b><small>下限</small></span>
+          <span><b>${escapeHtml(precisePrice(range.upperPrice))}</b><small>上限</small></span>
+        </div>
+      </div>
+      ${retired ? '' : `<div class="lm-range-status ${position.inRange ? 'in-range' : 'out-range'}">
+        <span><i></i>${rangeStatusText}</span>
+        <strong>${escapeHtml(range.currentGrid)}/${escapeHtml(range.gridCount)} 格</strong>
+      </div>`}
+      <div class="lm-raw-ticks">
+        <span>Tick</span>
+        <b>${escapeHtml(position.tickLower)} / ${escapeHtml(position.currentTick)} / ${escapeHtml(position.tickUpper)}</b>
+      </div>
+    </div>
+  ` : `
+    <div class="lm-raw-ticks lm-raw-ticks-only">
+      <span>范围 Tick</span>
+      <b>${escapeHtml(position.tickLower)} / ${escapeHtml(position.currentTick)} / ${escapeHtml(position.tickUpper)}</b>
+    </div>
+  `;
+  return `
+  <article class="lm-position-card" data-lm-position-card data-nft-id="${escapeHtml(position.nftId)}">
+    <header class="lm-position-heading">
+      <div class="lm-position-identity">
+        <strong>${escapeHtml(position.token0.symbol)} / ${escapeHtml(position.token1.symbol)}</strong>
+        <div class="lm-position-ids">
+          <span>Pool ID <button class="lm-copy-value" type="button" data-lm-copy="${escapeHtml(position.poolId)}"
+            data-copy-label="Pool ID" data-tooltip="复制 Pool ID" aria-label="复制 Pool ID">
+            <b title="${escapeHtml(position.poolId)}">${escapeHtml(shortAddress(position.poolId))}</b>${operationIcon('copy')}
+          </button></span>
+          <span>NFT ID <button class="lm-copy-value" type="button" data-lm-copy="${escapeHtml(position.nftId)}"
+            data-copy-label="NFT ID" data-tooltip="复制 NFT ID" aria-label="复制 NFT ID">
+            <b>#${escapeHtml(position.nftId)}</b>${operationIcon('copy')}
+          </button></span>
+        </div>
+      </div>
+    </header>
+
+    <section class="lm-strategy-position">
+      <div class="lm-card-action-bar">
+        <button class="lm-record-action" type="button" data-lm-open-records
+          data-tooltip="操作记录" aria-label="操作记录">
+          ${operationIcon('records')}
+        </button>
+        <div class="lm-position-actions" aria-label="仓位操作">
+          ${retired ? '' : `
+            <button class="lm-icon-action increase" type="button" data-lm-open-operation="increase"
+              data-tooltip="补仓" aria-label="补仓">${operationIcon('increase')}</button>
+            <button class="lm-icon-action reduce" type="button" data-lm-open-operation="reduce"
+              data-tooltip="减仓" aria-label="减仓">${operationIcon('reduce')}</button>
+            <button class="lm-icon-action withdraw" type="button" data-lm-open-operation="withdraw"
+              data-tooltip="撤出流动性" aria-label="撤出流动性">${operationIcon('withdraw')}</button>
+            <button class="lm-icon-action emergency" type="button" data-lm-open-operation="emergency"
+              data-tooltip="紧急撤退" aria-label="紧急撤退">${operationIcon('emergency')}</button>
+          `}
+          ${invalid ? `<button class="lm-icon-action cleanup" type="button" data-lm-clean-invalid
+            data-tooltip="清理无效策略" aria-label="清理无效策略">${operationIcon('cleanup')}</button>` : ''}
+        </div>
+      </div>
+
+      ${emptyLiquidity ? `
+        <div class="lm-empty-liquidity" role="status">仓位中没有流动性</div>
+      ` : `
+        <div class="lm-composition-track" aria-hidden="true">
+          <span style="width:${token0Share}%"></span>
+          <span style="width:${100 - token0Share}%"></span>
+        </div>
+
+        <div class="lm-token-rows">
+          <div>
+            <span><i class="token0"></i>${escapeHtml(position.token0.symbol)}</span>
+            ${tokenAmountMarkup(position.token0, 'token0')}
+          </div>
+          <div>
+            <span><i class="token1"></i>${escapeHtml(position.token1.symbol)}</span>
+            ${tokenAmountMarkup(position.token1, 'token1')}
+          </div>
+        </div>
+
+        <div class="lm-position-total-row">
+          <span>仓位总价值 (${escapeHtml(position.valueInStablecoin?.symbol || 'U')})<small>含未领取手续费</small></span>
+          <strong>${escapeHtml(value)}</strong>
+        </div>
+      `}
+
+      ${rangeMarkup}
+    </section>
+    ${position.hooksWarning ? `<div class="lm-hook-warning">${escapeHtml(position.hooksWarning)}</div>` : ''}
+    ${position.unsupportedReason ? `<div class="preview-error">${escapeHtml(position.unsupportedReason)}</div>` : ''}
+  </article>
+  `;
 }
 
 function renderPosition() {
   const element = panel.querySelector('#lmPositionCard');
-  const position = state.position;
-  if (!position) {
-    element.className = 'lm-position-empty';
-    element.textContent = '输入 NFT ID 后读取币对、区间和当前流动性。';
+  if (!element) return;
+  if (!state.positions.length) {
+    element.className = 'lm-position-list';
+    element.innerHTML = `
+      <div class="lm-position-empty">
+        <strong>${state.positionPollStopped ? '暂时无法读取策略仓位' : '当前钱包暂无策略仓位'}</strong>
+        <span>${state.positionPollStopped ? '请检查 RPC 或 PRIVATE_KEY 配置后重试。' : '初始化流动性后，仓位会自动出现在这里。'}</span>
+      </div>
+    `;
+    refreshInvalidCleanupButton();
     return;
   }
-  const value = position.valueInStablecoin
-    ? `≈ ${compactNumber(position.valueInStablecoin.formatted, 4)} ${position.valueInStablecoin.symbol}`
-    : '暂不支持估值';
-  element.className = 'lm-position-card';
-  element.innerHTML = `
-    <div class="lm-position-heading">
-      <div>
-        <span>NFT #${escapeHtml(position.nftId)}</span>
-        <strong>${escapeHtml(position.token0.symbol)} / ${escapeHtml(position.token1.symbol)}</strong>
-      </div>
-      <span class="lm-range-state ${position.inRange ? 'in-range' : 'out-range'}">
-        ${position.inRange ? '区间内' : '区间外'}
-      </span>
-    </div>
-    <div class="lm-position-total">
-      <span>仓位总计</span>
-      <strong>${escapeHtml(value)}</strong>
-    </div>
-    <div class="lm-token-grid">
-      <div>
-        <span>${escapeHtml(position.token0.symbol)}${position.token0.isStablecoin ? ' · 稳定币' : ''}</span>
-        <strong>${escapeHtml(compactNumber(position.token0.amount))}</strong>
-      </div>
-      <div>
-        <span>${escapeHtml(position.token1.symbol)}${position.token1.isStablecoin ? ' · 稳定币' : ''}</span>
-        <strong>${escapeHtml(compactNumber(position.token1.amount))}</strong>
-      </div>
-    </div>
-    <dl class="lm-position-facts">
-      <div><dt>价格区间</dt><dd>${escapeHtml(positionRange(position))}</dd></div>
-      <div><dt>当前价格</dt><dd>${escapeHtml(compactNumber(position.activePrice))} ${escapeHtml(position.stablecoin?.symbol || '')}</dd></div>
-      <div><dt>Tick</dt><dd>${position.tickLower} / ${position.currentTick} / ${position.tickUpper}</dd></div>
-      <div><dt>流动性</dt><dd>${escapeHtml(position.liquidity)}</dd></div>
-      <div><dt>Pool ID</dt><dd title="${escapeHtml(position.poolId)}">${escapeHtml(shortAddress(position.poolId))}</dd></div>
-    </dl>
-    ${position.hooksWarning ? `<div class="lm-hook-warning">${escapeHtml(position.hooksWarning)}</div>` : ''}
-    ${position.unsupportedReason ? `<div class="preview-error">${escapeHtml(position.unsupportedReason)}</div>` : ''}
-  `;
+  element.className = 'lm-position-list';
+  element.innerHTML = state.positions.map(positionCardMarkup).join('');
+  if (state.selectedNftId) selectPosition(state.selectedNftId);
+  bindPositionActions();
+  refreshInvalidCleanupButton();
 }
 
 function currentBudget() {
@@ -311,7 +662,7 @@ function operationRequiresSwap() {
 
 function actionDisabledReason() {
   if (state.busy) return '正在处理';
-  if (!state.position) return '请先读取仓位';
+  if (!state.position) return '请先选择策略仓位';
   if (!state.position.supported) return state.position.unsupportedReason || '当前仓位不受支持';
   if (!state.options?.privateKeyConfigured) return '服务端缺少 PRIVATE_KEY';
   if (!state.options?.executionEnabled) return 'LIQUIDITY_EXECUTE 尚未开启';
@@ -328,8 +679,169 @@ function actionDisabledReason() {
   return null;
 }
 
+function openOperation(operation, nftId = state.selectedNftId) {
+  const position = selectPosition(nftId);
+  if (!OPERATION_META[operation] || !position || isEmergencyRetired(position)) return;
+  state.operation = operation;
+  state.modalOpen = true;
+  const modal = panel.querySelector('#lmOperationModal');
+  const title = panel.querySelector('#lmModalTitle');
+  const summary = panel.querySelector('#lmModalSummary');
+  title.textContent = OPERATION_META[operation].label;
+  summary.hidden = true;
+  summary.innerHTML = '';
+  modal.hidden = false;
+  syncModalState();
+  refreshOperation();
+  window.setTimeout(() => panel.querySelector('#lmActionButton')?.focus(), 0);
+}
+
+function closeOperation(force = false) {
+  if (state.busy && !force) return;
+  state.modalOpen = false;
+  panel.querySelector('#lmOperationModal').hidden = true;
+  syncModalState();
+}
+
+function syncModalState() {
+  document.body.classList.toggle('lm-modal-open', Boolean(document.querySelector('.lm-modal:not([hidden])')));
+}
+
+function formatActionTime(action) {
+  const timestamp = actionTimestamp(action);
+  if (!timestamp) return '—';
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return timestamp;
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(date);
+}
+
+function actionOutcome(action) {
+  const inFlight = state.status?.inFlight && state.status?.lastAction?.id === action.id;
+  if (inFlight) return { label: '执行中', className: 'running' };
+  if (action.stage === 'completed') return { label: '成功', className: 'success' };
+  if (action.stage === 'needs_attention') return { label: '需要处理', className: 'attention' };
+  if (action.stage === 'failed') return { label: '失败', className: 'failed' };
+  if (action.stage === 'cancelled') return { label: '已取消', className: 'cancelled' };
+  return { label: stageLabel(action.stage), className: 'running' };
+}
+
+function renderRecords() {
+  const body = panel.querySelector('#lmRecordsBody');
+  if (!body) return;
+  const records = positionActionRecords();
+  if (!records.length) {
+    body.innerHTML = '<div class="lm-records-empty">当前策略暂无操作记录。</div>';
+    return;
+  }
+  const blockingAction = state.status?.lastAction?.stage === 'needs_attention'
+    && String(state.status.lastAction.nftId) === String(state.position?.nftId)
+    ? state.status.lastAction
+    : null;
+  body.innerHTML = `
+    <div class="lm-record-list">
+      ${records.map((action) => {
+        const outcome = actionOutcome(action);
+        return `
+          <article class="lm-record-item">
+            <dl>
+              <div><dt>操作行为</dt><dd>${escapeHtml(OPERATION_META[action.operation]?.label || action.operation)}</dd></div>
+              <div><dt>操作结果</dt><dd><span class="lm-record-result ${outcome.className}">${escapeHtml(outcome.label)}</span></dd></div>
+              <div><dt>操作时间</dt><dd>${escapeHtml(formatActionTime(action))}</dd></div>
+            </dl>
+            ${action.error ? `<p class="lm-record-error">${escapeHtml(action.error)}</p>` : ''}
+          </article>
+        `;
+      }).join('')}
+    </div>
+    ${blockingAction ? '<div id="lmRecordRecovery" class="lm-record-recovery"></div>' : ''}
+  `;
+  if (blockingAction) renderRecovery(blockingAction);
+}
+
+function openRecords() {
+  if (!state.position) return;
+  state.recordsOpen = true;
+  renderRecords();
+  panel.querySelector('#lmRecordsModal').hidden = false;
+  syncModalState();
+  window.setTimeout(() => panel.querySelector('#lmRecordsClose')?.focus(), 0);
+}
+
+function closeRecords() {
+  state.recordsOpen = false;
+  panel.querySelector('#lmRecordsModal').hidden = true;
+  syncModalState();
+}
+
+function resolveConfirm(accepted) {
+  const resolver = state.confirmResolver;
+  if (!resolver) return;
+  state.confirmResolver = null;
+  panel.querySelector('#lmConfirmModal').hidden = true;
+  syncModalState();
+  resolver(Boolean(accepted));
+}
+
+function confirmAction({ title, message, confirmLabel = '确认', danger = false }) {
+  if (state.confirmResolver) resolveConfirm(false);
+  const modal = panel.querySelector('#lmConfirmModal');
+  const accept = panel.querySelector('#lmConfirmAccept');
+  panel.querySelector('#lmConfirmTitle').textContent = title;
+  panel.querySelector('#lmConfirmMessage').textContent = message;
+  accept.textContent = confirmLabel;
+  accept.className = danger ? 'danger-button' : 'primary-button';
+  modal.hidden = false;
+  syncModalState();
+  window.setTimeout(() => accept.focus(), 0);
+  return new Promise((resolve) => {
+    state.confirmResolver = resolve;
+  });
+}
+
+async function cleanupInvalidStrategies(nftIds = invalidStrategies().map((position) => position.nftId)) {
+  const ids = [...new Set(nftIds.map((id) => String(id || '').trim()).filter((id) => /^\d+$/.test(id)))];
+  if (!ids.length || state.busy || state.status?.inFlight) return;
+  const confirmed = await confirmAction({
+    title: '清空无效策略',
+    message: `将从策略列表移除 ${ids.length} 个没有流动性的仓位：\nNFT #${ids.join('、#')}\n\n不会影响已有代币余额；后续自动发现也不会再次展示这些无效策略。确认继续吗？`,
+    confirmLabel: '确认清理',
+    danger: true
+  });
+  if (!confirmed) return;
+
+  state.busy = true;
+  refreshInvalidCleanupButton();
+  refreshPositionActions();
+  setMessage('正在清理无效策略…');
+  try {
+    const result = await request('/cleanup-invalid', {
+      method: 'POST',
+      body: JSON.stringify({ nftIds: ids, confirmed: true })
+    });
+    showToast(`已清理 ${result.cleaned?.length || ids.length} 个无效策略`);
+    setMessage('无效策略已从列表移除', 'success');
+    await refreshPositions();
+  } catch (error) {
+    setMessage(error.message, 'error');
+    showToast(error.message, 'error');
+  } finally {
+    state.busy = false;
+    refreshInvalidCleanupButton();
+    refreshPositionActions();
+  }
+}
+
 function refreshOperation() {
   const body = panel.querySelector('#lmOperationBody');
+  if (!body) return;
   body.innerHTML = operationBodyMarkup();
   for (const button of panel.querySelectorAll('[data-lm-budget]')) {
     button.addEventListener('click', () => {
@@ -347,6 +859,7 @@ function refreshOperation() {
     button.addEventListener('click', () => {
       range.value = button.dataset.lmPercent;
       panel.querySelector('#lmReduceValue').textContent = range.value;
+      refreshActionButton();
     });
   }
   refreshActionButton();
@@ -358,11 +871,11 @@ function refreshActionButton() {
   const reason = actionDisabledReason();
   button.disabled = Boolean(reason);
   button.textContent = state.busy ? '正在核对链上状态…' : OPERATION_META[state.operation].button;
-  button.title = reason || '';
+  refreshPositionActions();
 }
 
 function collectPayload() {
-  const nftId = panel.querySelector('#lmNftId').value.trim();
+  const nftId = String(state.position?.nftId || '').trim();
   const payload = { operation: state.operation, nftId };
   if (state.operation === 'increase') payload.budget = currentBudget();
   if (state.operation === 'reduce') payload.percent = panel.querySelector('#lmReducePercent').value;
@@ -397,14 +910,12 @@ function planRows(plan) {
 }
 
 function renderPlan(plan) {
-  const summary = panel.querySelector('#lmSummary');
-  const badge = panel.querySelector('#lmSummaryBadge');
+  const summary = panel.querySelector('#lmModalSummary');
   const settlementNotice = ['increase', 'emergency'].includes(plan.operation)
     ? '预计值用于确认操作范围；兑换按链上实际成交数量结算，撤出结果包含本次领取的手续费。'
     : '预计值用于确认操作范围；撤出按链上实际到账数量结算，双币直接到账且不兑换。';
-  badge.className = 'summary-badge ready';
-  badge.textContent = '等待确认';
-  summary.className = 'lm-summary-content';
+  summary.hidden = false;
+  summary.className = 'lm-modal-summary visible';
   summary.innerHTML = `
     <div class="lm-summary-title">
       <span>${escapeHtml(OPERATION_META[plan.operation].label)}</span>
@@ -454,116 +965,89 @@ function stageLabel(stage) {
   })[stage] || stage || '待操作';
 }
 
-function transactionMarkup(action) {
-  const transactions = [...(action.transactions || [])];
-  if (action.currentTx?.hash && !transactions.some((item) => item.hash === action.currentTx.hash)) {
-    transactions.push(action.currentTx);
-  }
-  if (!transactions.length) return '';
-  return `
-    <div class="lm-transaction-list">
-      ${transactions.map((transaction) => `
-        <a href="https://bscscan.com/tx/${encodeURIComponent(transaction.hash)}" target="_blank" rel="noreferrer">
-          <span>${escapeHtml(transaction.kind.replaceAll('_', ' '))}</span>
-          <strong>${escapeHtml(shortAddress(transaction.hash))}</strong>
-          <small>${escapeHtml(transaction.status || 'pending')}</small>
-        </a>
-      `).join('')}
-    </div>
-  `;
-}
-
-function actionResultRows(action) {
-  const rows = [];
-  if (action.finalLiquidity !== undefined) rows.push(['最终流动性', action.finalLiquidity]);
-  if (action.actualLiquidityDelta) rows.push(['实际新增流动性', action.actualLiquidityDelta]);
-  if (action.receivedAmounts) {
-    for (const token of [action.token0, action.token1]) {
-      const raw = action.receivedAmounts[token.address];
-      if (raw !== undefined) rows.push([`${token.symbol} 实际到账`, formatRaw(raw, token.decimals)]);
-    }
-  }
-  if (action.finalStableReceived !== undefined) {
-    rows.push([`${action.stablecoin.symbol} 合计到账`, formatRaw(action.finalStableReceived, action.stablecoin.decimals)]);
-  }
-  return rows;
-}
-
 function renderAction(action, inFlight = false) {
   if (!action) return;
-  const badge = panel.querySelector('#lmSummaryBadge');
-  const summary = panel.querySelector('#lmSummary');
-  const stage = action.stage;
-  const badgeState = stage === 'completed' ? 'success' : stage === 'failed' || stage === 'needs_attention' ? 'danger' : 'ready';
-  badge.className = `summary-badge ${badgeState}`;
-  badge.textContent = stageLabel(stage);
-  const results = actionResultRows(action);
-  summary.className = 'lm-summary-content';
-  summary.innerHTML = `
-    <div class="lm-summary-title">
-      <span>${escapeHtml(OPERATION_META[action.operation]?.label || action.operation)}</span>
-      <strong>NFT #${escapeHtml(action.nftId)}</strong>
-    </div>
-    <div class="lm-stage-line${inFlight ? ' running' : ''}">
-      <span></span>
-      <div><strong>${escapeHtml(stageLabel(stage))}</strong><small>${inFlight ? '链上任务执行中，请勿重复提交' : escapeHtml(action.completedAt || action.failedAt || '')}</small></div>
-    </div>
-    ${results.length ? `<dl class="lm-summary-list">${results.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>` : ''}
-    ${transactionMarkup(action)}
-    ${action.error ? `<div class="preview-error">${escapeHtml(action.error)}</div>` : ''}
-    ${action.cleanupWarning ? `<div class="lm-hook-warning">${escapeHtml(action.cleanupWarning)}</div>` : ''}
-  `;
-  renderRecovery(action);
+  state.status = { ...state.status, inFlight, lastAction: action };
+  mergeActionRecord(action);
+  if (state.recordsOpen) renderRecords();
+  refreshPositionActions();
 }
 
 function renderRecovery(action) {
-  const recovery = panel.querySelector('#lmRecovery');
-  recovery.hidden = true;
+  const recovery = panel.querySelector('#lmRecordRecovery');
+  if (!recovery) return;
   recovery.innerHTML = '';
   if (action?.stage !== 'needs_attention') return;
   if (action.currentTx?.hash) {
-    recovery.hidden = false;
     const label = action.cleanupContext ? '核对授权清理交易' : '核对链上交易';
     recovery.innerHTML = `<button id="lmResolveButton" class="secondary-button" type="button">${label}</button>`;
     recovery.querySelector('button').addEventListener('click', resolveTransaction);
   } else if (action.cleanupContext) {
-    recovery.hidden = false;
     recovery.innerHTML = '<button id="lmCleanupButton" class="secondary-button" type="button">重新清理 OKX 授权</button>';
     recovery.querySelector('button').addEventListener('click', retryCleanup);
   } else if (action.pendingSwap) {
-    recovery.hidden = false;
     recovery.innerHTML = '<button id="lmRetryButton" class="primary-button" type="button">仅重试稳定币兑换</button>';
     recovery.querySelector('button').addEventListener('click', retrySwap);
   }
 }
 
-async function loadPosition(event) {
-  event?.preventDefault();
-  const nftId = panel.querySelector('#lmNftId').value.trim();
-  if (!/^\d+$/.test(nftId)) {
-    setMessage('NFT ID 必须是数字', 'error');
-    return;
-  }
-  const button = panel.querySelector('#lmLoadPosition');
-  button.disabled = true;
-  button.textContent = '读取中…';
-  setMessage('正在读取 NFT 与池子状态…');
+async function requestPositions() {
   try {
-    state.position = await request('/position', {
-      method: 'POST',
-      body: JSON.stringify({ nftId })
-    });
-    renderPosition();
-    refreshOperation();
-    setMessage(`已读取 NFT #${nftId}`, 'success');
+    return await request('/positions');
   } catch (error) {
-    state.position = null;
+    // Older running services exposed a different discovery path. Keep the UI
+    // usable during a rolling restart while the canonical route is deployed.
+    if (error.status !== 404) throw error;
+    return request('/position-list');
+  }
+}
+
+function schedulePositionPolling(delay = POSITION_POLL_INTERVAL_MS) {
+  window.clearTimeout(state.positionPollTimer);
+  if (state.positionPollStopped) return;
+  state.positionPollTimer = window.setTimeout(() => refreshPositions(), delay);
+}
+
+async function refreshPositions() {
+  if (state.positionPollInFlight || state.positionPollStopped) return;
+  state.positionPollInFlight = true;
+  try {
+    const data = await requestPositions();
+    state.positions = Array.isArray(data.positions) ? data.positions : [];
+    if (state.selectedNftId) {
+      state.position = state.positions.find((item) => (
+        String(item.nftId) === String(state.selectedNftId)
+      )) || null;
+    }
+    if (!state.position && state.positions.length) {
+      state.position = state.positions[0];
+      state.selectedNftId = String(state.position.nftId);
+    }
+    if (state.modalOpen && !state.position) closeOperation(true);
+    state.positionPollStopped = false;
     renderPosition();
-    refreshActionButton();
+    if (!state.modalOpen) refreshOperation();
+    const pollStatus = panel.querySelector('#lmPollStatusText');
+    if (pollStatus) {
+      const discovery = data.discovery || {};
+      const emptyPositionCount = Number(discovery.emptyPositionCount) || 0;
+      pollStatus.textContent = discovery.scanning
+        ? `正在发现仓位 · ${state.positions.length} 个已载入`
+        : `已载入 ${state.positions.length} 个有流动性策略`
+          + (emptyPositionCount ? ` · 已忽略 ${emptyPositionCount} 个空仓` : '')
+          + ' · 每 1.5s 检查';
+    }
+    if (data.discovery?.error && !state.positions.length) {
+      setMessage(`仓位发现受限：${data.discovery.error}`, 'error');
+    }
+  } catch (error) {
+    state.positionPollStopped = false;
+    const pollStatus = panel.querySelector('#lmPollStatusText');
+    if (pollStatus) pollStatus.textContent = `自动刷新失败 · 将重试（${error.message}）`;
     setMessage(error.message, 'error');
   } finally {
-    button.disabled = false;
-    button.textContent = '读取仓位';
+    state.positionPollInFlight = false;
+    schedulePositionPolling(POSITION_POLL_INTERVAL_MS);
   }
 }
 
@@ -583,7 +1067,13 @@ async function executeOperation() {
       body: JSON.stringify(payload)
     });
     renderPlan(plan);
-    if (!window.confirm(confirmationText(plan))) {
+    const confirmed = await confirmAction({
+      title: `确认${OPERATION_META[plan.operation].label}`,
+      message: confirmationText(plan),
+      confirmLabel: OPERATION_META[plan.operation].label,
+      danger: ['withdraw', 'emergency'].includes(plan.operation)
+    });
+    if (!confirmed) {
       setMessage('已取消，未发送任何链上交易');
       return;
     }
@@ -602,12 +1092,14 @@ async function executeOperation() {
     renderAction(action, false);
     setMessage(`${OPERATION_META[payload.operation].label}已完成`, 'success');
     showToast(`${OPERATION_META[payload.operation].label}已完成`);
-    await loadPosition();
+    closeOperation(true);
+    await refreshPositions();
   } catch (error) {
     const action = error.data?.action;
     if (action) {
       state.status = { inFlight: false, lastAction: action };
       renderAction(action, false);
+      closeOperation(true);
     }
     setMessage(error.message, 'error');
     showToast(error.message, 'error');
@@ -619,7 +1111,12 @@ async function executeOperation() {
 }
 
 async function retrySwap() {
-  if (!window.confirm('只重试待处理的代币 → 稳定币兑换，不会再次撤出流动性。确认继续？')) return;
+  const confirmed = await confirmAction({
+    title: '重试稳定币兑换',
+    message: '只重试待处理的代币 → 稳定币兑换，不会再次撤出流动性。',
+    confirmLabel: '确认重试'
+  });
+  if (!confirmed) return;
   state.busy = true;
   refreshActionButton();
   setMessage('正在重试稳定币兑换…');
@@ -641,7 +1138,12 @@ async function retrySwap() {
 }
 
 async function retryCleanup() {
-  if (!window.confirm('只重试清理本次 OKX 代币授权，不会重新兑换或撤出流动性。确认继续？')) return;
+  const confirmed = await confirmAction({
+    title: '重新清理授权',
+    message: '只重试清理本次 OKX 代币授权，不会重新兑换或撤出流动性。',
+    confirmLabel: '确认清理'
+  });
+  if (!confirmed) return;
   state.busy = true;
   refreshActionButton();
   setMessage('正在清理 OKX 授权…');
@@ -664,7 +1166,12 @@ async function retryCleanup() {
 }
 
 async function resolveTransaction() {
-  if (!window.confirm('将读取链上回执并核对任务状态，不会重新发送交易。确认继续？')) return;
+  const confirmed = await confirmAction({
+    title: '核对链上交易',
+    message: '将读取链上回执并核对任务状态，不会重新发送交易。',
+    confirmLabel: '开始核对'
+  });
+  if (!confirmed) return;
   state.busy = true;
   refreshActionButton();
   try {
@@ -687,7 +1194,9 @@ async function resolveTransaction() {
 async function refreshStatus() {
   const status = await request('/status');
   state.status = status;
+  if (Array.isArray(status.actionHistory)) state.actionHistory = status.actionHistory;
   if (status.lastAction) renderAction(status.lastAction, status.inFlight);
+  if (state.recordsOpen) renderRecords();
   refreshActionButton();
   if (status.inFlight || (status.lastAction && !TERMINAL_STAGES.has(status.lastAction.stage))) {
     startStatusPolling();
@@ -708,20 +1217,30 @@ function stopStatusPolling() {
 }
 
 function bindEvents() {
-  panel.querySelector('#lmPositionForm').addEventListener('submit', loadPosition);
+  panel.querySelector('#lmOpenCreateButton').addEventListener('click', openCreateModal);
+  panel.querySelector('#lmClearInvalidButton').addEventListener('click', () => cleanupInvalidStrategies());
+  createModal?.querySelector('#liquidityCreateModalClose')?.addEventListener('click', closeCreateModal);
+  createModal?.querySelector('[data-lm-close-create]')?.addEventListener('click', closeCreateModal);
   panel.querySelector('#lmActionButton').addEventListener('click', executeOperation);
-  for (const button of panel.querySelectorAll('[data-lm-operation]')) {
-    button.addEventListener('click', () => {
-      state.operation = button.dataset.lmOperation;
-      for (const item of panel.querySelectorAll('[data-lm-operation]')) {
-        const active = item === button;
-        item.classList.toggle('active', active);
-        item.setAttribute('aria-selected', String(active));
-      }
-      refreshOperation();
-      setMessage('');
-    });
-  }
+  panel.querySelector('#lmModalClose').addEventListener('click', () => closeOperation());
+  panel.querySelector('[data-lm-close-operation]').addEventListener('click', () => closeOperation());
+  panel.querySelector('#lmRecordsClose').addEventListener('click', closeRecords);
+  panel.querySelector('[data-lm-close-records]').addEventListener('click', closeRecords);
+  panel.querySelector('#lmConfirmCancel').addEventListener('click', () => resolveConfirm(false));
+  panel.querySelector('#lmConfirmAccept').addEventListener('click', () => resolveConfirm(true));
+  panel.querySelector('[data-lm-cancel-confirm]').addEventListener('click', () => resolveConfirm(false));
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (state.confirmResolver) resolveConfirm(false);
+    else if (state.recordsOpen) closeRecords();
+    else if (state.modalOpen) closeOperation();
+    else if (createModal && !createModal.hidden) closeCreateModal();
+  });
+  window.addEventListener('liquidity:create-completed', () => {
+    closeCreateModal();
+    showToast('流动性初始化成功');
+    refreshPositions();
+  });
 }
 
 async function loadManagement() {
@@ -733,6 +1252,7 @@ async function loadManagement() {
       inFlight: state.options.inFlight,
       lastAction: state.options.lastAction
     };
+    state.actionHistory = Array.isArray(state.options.actionHistory) ? state.options.actionHistory : [];
     if (state.options.lastAction) renderAction(state.options.lastAction, state.options.inFlight);
     refreshActionButton();
     const issues = [];
@@ -740,6 +1260,7 @@ async function loadManagement() {
     if (!state.options.executionEnabled) issues.push('LIQUIDITY_EXECUTE=false');
     setMessage(issues.length ? `当前只可查看：${issues.join('；')}` : '执行环境已就绪');
     if (state.options.inFlight) startStatusPolling();
+    refreshPositions();
   } catch (error) {
     setMessage(error.message, 'error');
   }
@@ -749,9 +1270,4 @@ renderShell();
 bindEvents();
 renderPosition();
 refreshOperation();
-
-for (const button of tabButtons) {
-  button.addEventListener('click', () => switchTab(button.dataset.liquidityTab));
-}
-
-switchTab(location.hash === '#manage' ? 'manage' : 'create', false);
+loadManagement();

@@ -75,24 +75,64 @@ async function writeJsonAtomic(path, value) {
   await fs.rename(temporaryPath, path);
 }
 
+export function createLiquidityFallbackProvider(providers, config = {}) {
+  if (!providers.length) throw new Error('没有可用的 BSC RPC');
+  const configuredQuorum = Number(config.rpcQuorum);
+  const defaultQuorum = Math.min(2, providers.length);
+  const quorum = Number.isSafeInteger(configuredQuorum) && configuredQuorum > 0
+    ? Math.min(configuredQuorum, providers.length)
+    : defaultQuorum;
+  const stallTimeout = Math.max(100, Math.min(
+    1_000,
+    Number(config.rpcStallTimeoutMs) || 400
+  ));
+  return new ethers.FallbackProvider(providers.map((provider, index) => ({
+    provider,
+    priority: index + 1,
+    stallTimeout,
+    weight: 1
+  })), Number(CHAIN_ID), { quorum });
+}
+
 async function openProvider(config) {
   const timeoutMs = Math.max(1000, Number(config.rpcTimeoutMs) || 5000);
+  const urls = [...new Set((config.rpcUrls || []).filter(Boolean))];
+  if (!urls.length) throw new Error('没有可用的 BSC RPC：未配置 rpcUrls');
+
+  const candidates = urls.map((url) => {
+    const request = new ethers.FetchRequest(url);
+    request.timeout = timeoutMs;
+    return {
+      url,
+      provider: new ethers.JsonRpcProvider(request, Number(CHAIN_ID), {
+        batchMaxCount: 1,
+        staticNetwork: true
+      })
+    };
+  });
+  const checks = await Promise.allSettled(candidates.map(async ({ url, provider }) => {
+    const chainId = BigInt(await withTimeout(
+      provider.send('eth_chainId', []),
+      timeoutMs,
+      `RPC 连接超时：${url}`
+    ));
+    if (chainId !== CHAIN_ID) throw new Error(`RPC chainId 不是 56：${url}`);
+    return provider;
+  }));
+  const available = [];
   const errors = [];
-  for (const url of config.rpcUrls || []) {
-    const provider = new ethers.JsonRpcProvider(url, Number(CHAIN_ID), {
-      batchMaxCount: 1,
-      staticNetwork: true
-    });
-    try {
-      const network = await withTimeout(provider.getNetwork(), timeoutMs, `RPC 连接超时：${url}`);
-      if (network.chainId !== CHAIN_ID) throw new Error(`RPC chainId 不是 56：${url}`);
-      return provider;
-    } catch (error) {
-      errors.push(error.message);
-      provider.destroy();
+  checks.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      available.push(result.value);
+    } else {
+      errors.push(`${candidates[index].url}: ${result.reason?.message || '连接失败'}`);
+      candidates[index].provider.destroy();
     }
+  });
+  if (!available.length) {
+    throw new Error(`没有可用的 BSC RPC：${errors.at(-1) || '连接失败'}`);
   }
-  throw new Error(`没有可用的 BSC RPC：${errors.at(-1) || '未配置 rpcUrls'}`);
+  return createLiquidityFallbackProvider(available, config);
 }
 
 export function integerSqrt(value) {
@@ -933,6 +973,62 @@ function amountCapsFromTradeQuote(plan, tradeAmount, quoteAmount) {
     : { amount0Max: BigInt(quoteAmount), amount1Max: BigInt(tradeAmount) };
 }
 
+export function recoveryAmountCaps(action) {
+  const token0 = action?.plan?.token0;
+  const token1 = action?.plan?.token1;
+  if (!token0 || !token1) throw new Error('恢复任务缺少仓位代币数量');
+  try {
+    const amount0Max = ethers.parseUnits(String(token0.amountMax), Number(token0.decimals));
+    const amount1Max = ethers.parseUnits(String(token1.amountMax), Number(token1.decimals));
+    if (amount0Max <= 0n && amount1Max <= 0n) throw new Error('仓位投入为零');
+    return { amount0Max, amount1Max };
+  } catch (error) {
+    throw new Error(`恢复任务的仓位数量无效：${error.message}`);
+  }
+}
+
+export function isRecoverableLiquidityAction(action, input, config, owner) {
+  if (!action || !['failed', 'cancelled'].includes(action.stage)) return false;
+  if (actionIsInitializeOnly(action) || input.executionMode !== EXECUTION_MODE_INITIALIZE_AND_ADD) {
+    return false;
+  }
+  if (!owner || ethers.getAddress(action.wallet) !== ethers.getAddress(owner)) return false;
+  if (action.currentTx?.hash || action.liquidityTxHash || action.nftId
+    || action.positionReconciliation?.found) return false;
+  const initializationConfirmed = action.transactions?.some((entry) => (
+    entry.kind === 'initialize_pool'
+      && entry.status !== 'failed'
+      && entry.blockNumber !== null
+      && entry.blockNumber !== undefined
+  ));
+  if (!initializationConfirmed) return false;
+  if (!['confirmed', 'not_required'].includes(action.autoSwap?.status)) return false;
+  try {
+    const priorInput = normalizeLiquidityInput(action.request, config);
+    recoveryAmountCaps(action);
+    return liquidityExecutionFingerprint(priorInput) === liquidityExecutionFingerprint(input);
+  } catch {
+    return false;
+  }
+}
+
+function recoveredAutoAllocation(action, plan, amountCaps) {
+  const tradeAmount = plan.tradeIsCurrency0 ? amountCaps.amount0Max : amountCaps.amount1Max;
+  const quoteAmount = plan.tradeIsCurrency0 ? amountCaps.amount1Max : amountCaps.amount0Max;
+  return {
+    recovered: true,
+    required: false,
+    stableInput: quoteAmount,
+    stableToSwap: 0n,
+    quoteForLiquidity: quoteAmount,
+    quotedTradeAmount: tradeAmount,
+    spender: null,
+    approvalRequired: false,
+    amountCaps,
+    previousSwapHash: action.autoSwap?.hash || null
+  };
+}
+
 async function buildAutoAllocationQuote(provider, config, environment, plan, owner) {
   const allocation = plan.allocation;
   if (allocation.stableToSwap === 0n) {
@@ -1055,7 +1151,9 @@ function publicPlan(plan, config, autoAllocation = null) {
       sufficient1: plan.wallet.sufficient1,
       stableBalance: format(plan.wallet.stableBalance, plan.quote.decimals),
       tradeBalance: format(plan.wallet.tradeBalance, plan.trade.decimals),
-      stableInputSufficient: plan.wallet.stableInputSufficient
+      stableInputSufficient: autoAllocation?.recovered
+        ? plan.wallet.sufficient0 && plan.wallet.sufficient1
+        : plan.wallet.stableInputSufficient
     } : null,
     approvals: plan.approvals,
     approvalsReady: Boolean(plan.approvalsReady),
@@ -1065,15 +1163,20 @@ function publicPlan(plan, config, autoAllocation = null) {
       ? null
       : '自定义 Hooks 会在初始化或加流动性时执行外部合约逻辑',
     maximumBudget: String(config.maxStableBudget ?? 1000),
-    stableInputAmount: format(plan.stableInputAmount, plan.quote.decimals),
+    stableInputAmount: format(
+      autoAllocation?.recovered ? autoAllocation.stableInput : plan.stableInputAmount,
+      plan.quote.decimals
+    ),
     autoAllocation: autoAllocation ? {
+      recovered: Boolean(autoAllocation.recovered),
       required: autoAllocation.required,
       stableInput: format(autoAllocation.stableInput, plan.quote.decimals),
       stableToSwap: format(autoAllocation.stableToSwap, plan.quote.decimals),
       quoteForLiquidity: format(autoAllocation.quoteForLiquidity, plan.quote.decimals),
       quotedTradeAmount: format(autoAllocation.quotedTradeAmount, plan.trade.decimals),
       spender: autoAllocation.spender,
-      approvalRequired: autoAllocation.approvalRequired
+      approvalRequired: autoAllocation.approvalRequired,
+      previousSwapHash: autoAllocation.previousSwapHash || null
     } : null
   };
 }
@@ -1509,6 +1612,8 @@ function actionPlanSummary(plan) {
 
 function describeLiquidityExecutionError(error) {
   const diagnostic = [
+    error?.code,
+    error?.cause?.code,
     error?.data,
     error?.error?.data,
     error?.info?.error?.data,
@@ -1520,10 +1625,11 @@ function describeLiquidityExecutionError(error) {
       + '常见原因是转账税或特殊转账逻辑，已停止且未广播加池交易'
     );
   }
-  if (diagnostic.includes('socket hang up')
+  if (diagnostic.includes('client network socket disconnected')
+    || diagnostic.includes('socket hang up')
     || diagnostic.includes('econnreset')
     || diagnostic.includes('connection reset')) {
-    return new Error('BSC RPC 连接被节点中断（socket hang up）');
+    return new Error('BSC RPC HTTPS/TLS 连接被节点中断');
   }
   return error;
 }
@@ -1680,6 +1786,19 @@ export function createLiquidityRouter({
           walletAddress = null;
         }
       }
+      let recoveryAvailable = false;
+      if (walletAddress && lastAction?.request) {
+        try {
+          recoveryAvailable = isRecoverableLiquidityAction(
+            lastAction,
+            normalizeLiquidityInput(lastAction.request, config),
+            config,
+            walletAddress
+          );
+        } catch {
+          recoveryAvailable = false;
+        }
+      }
       res.json({
         chainId: Number(CHAIN_ID),
         stablecoins: normalizeStablecoins(config),
@@ -1690,6 +1809,7 @@ export function createLiquidityRouter({
         walletAddress,
         privateKeyConfigured: Boolean(walletAddress),
         autoAllocationConfigured: okxCredentialsConfigured(environment),
+        recoveryAvailable,
         executionEnabled: environment.LIQUIDITY_EXECUTE === 'true',
         inFlight,
         lastAction
@@ -1781,11 +1901,34 @@ export function createLiquidityRouter({
           throw new Error('PRIVATE_KEY 格式无效');
         }
       }
-      const basePlan = await buildPlan(provider, config, req.body, owner, false);
-      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
-      const autoAllocation = addsLiquidity
-        ? await buildAutoAllocationQuote(provider, config, environment, basePlan, owner)
+      const input = normalizeLiquidityInput(req.body, config);
+      const recoveryAction = isRecoverableLiquidityAction(lastAction, input, config, owner)
+        ? lastAction
         : null;
+      const recoveredCaps = recoveryAction ? recoveryAmountCaps(recoveryAction) : null;
+      const recoveredTicks = recoveryAction ? {
+        tickLower: Number(recoveryAction.plan.tickLower),
+        tickUpper: Number(recoveryAction.plan.tickUpper)
+      } : null;
+      const basePlan = await buildPlan(
+        provider,
+        config,
+        req.body,
+        owner,
+        false,
+        recoveredCaps,
+        Boolean(recoveryAction),
+        recoveredTicks
+      );
+      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
+      if (recoveryAction && (!basePlan.wallet?.sufficient0 || !basePlan.wallet?.sufficient1)) {
+        throw new Error('上次已兑换的仓位资产已不在钱包或数量不足，无法恢复加仓');
+      }
+      const autoAllocation = recoveryAction
+        ? recoveredAutoAllocation(recoveryAction, basePlan, recoveredCaps)
+        : (addsLiquidity
+          ? await buildAutoAllocationQuote(provider, config, environment, basePlan, owner)
+          : null);
       const plan = await buildPlan(
         provider,
         config,
@@ -1793,7 +1936,7 @@ export function createLiquidityRouter({
         owner,
         true,
         autoAllocation?.amountCaps || null,
-        false,
+        Boolean(recoveryAction),
         addsLiquidity
           ? { tickLower: basePlan.tickLower, tickUpper: basePlan.tickUpper }
           : null
@@ -1812,6 +1955,7 @@ export function createLiquidityRouter({
         requestedSqrtPriceX96: basePlan.requestedSqrtPriceX96.toString(),
         tickLower: basePlan.tickLower,
         tickUpper: basePlan.tickUpper,
+        recoveryActionId: recoveryAction?.id || null,
         expiresAt: Date.now() + previewValiditySeconds * 1000
       };
       previewAuthorizations.set(previewId, previewAuthorization);
@@ -1819,8 +1963,10 @@ export function createLiquidityRouter({
         ...publicPlan(plan, config, autoAllocation),
         previewId,
         previewExpiresAt: new Date(previewAuthorization.expiresAt).toISOString(),
+        recoveryMode: Boolean(recoveryAction),
+        recoveryActionId: recoveryAction?.id || null,
         privateKeyConfigured: Boolean(owner),
-        autoAllocationConfigured: okxCredentialsConfigured(environment),
+        autoAllocationConfigured: Boolean(recoveryAction) || okxCredentialsConfigured(environment),
         executionEnabled: environment.LIQUIDITY_EXECUTE === 'true'
       });
     } catch (error) {
@@ -1858,16 +2004,39 @@ export function createLiquidityRouter({
         throw new Error('PRIVATE_KEY 格式无效');
       }
       provider = await openProvider(config);
-      const basePlan = await buildPlan(provider, config, req.body, wallet.address, false);
-      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
       prunePreviewAuthorizations();
       const previewAuthorization = previewAuthorizations.get(String(req.body.previewId || ''));
+      const input = normalizeLiquidityInput(req.body, config);
+      const recoveryAction = previewAuthorization?.recoveryActionId
+        && previewAuthorization.recoveryActionId === lastAction?.id
+        && isRecoverableLiquidityAction(lastAction, input, config, wallet.address)
+        ? lastAction
+        : null;
+      if (previewAuthorization?.recoveryActionId && !recoveryAction) {
+        throw new Error('上次失败任务的恢复条件已变化，请重新预检');
+      }
+      const recoveredCaps = recoveryAction ? recoveryAmountCaps(recoveryAction) : null;
+      const recoveredTicks = recoveryAction ? {
+        tickLower: Number(recoveryAction.plan.tickLower),
+        tickUpper: Number(recoveryAction.plan.tickUpper)
+      } : null;
+      const basePlan = await buildPlan(
+        provider,
+        config,
+        req.body,
+        wallet.address,
+        false,
+        recoveredCaps,
+        Boolean(recoveryAction),
+        recoveredTicks
+      );
+      const addsLiquidity = basePlan.input.executionMode === EXECUTION_MODE_INITIALIZE_AND_ADD;
       assertLiquidityPreviewAuthorization(previewAuthorization, {
         previewId: String(req.body.previewId || ''),
         fingerprint: liquidityExecutionFingerprint(basePlan.input),
         owner: wallet.address
       });
-      assertExecutionPlanInvariant(basePlan, previewAuthorization);
+      assertExecutionPlanInvariant(basePlan, previewAuthorization, Boolean(recoveryAction));
       const lockedTicks = addsLiquidity ? {
         tickLower: previewAuthorization.tickLower,
         tickUpper: previewAuthorization.tickUpper
@@ -1875,14 +2044,19 @@ export function createLiquidityRouter({
       if (basePlan.input.hooks !== ZERO && !basePlan.input.acknowledgeCustomHooks) {
         throw new Error('使用自定义 Hooks 前必须勾选风险确认');
       }
-      if (addsLiquidity && !basePlan.wallet.stableInputSufficient) {
+      if (recoveryAction && (!basePlan.wallet.sufficient0 || !basePlan.wallet.sufficient1)) {
+        throw new Error('钱包余额不足，无法复用上次已兑换的资产恢复加仓');
+      }
+      if (addsLiquidity && !recoveryAction && !basePlan.wallet.stableInputSufficient) {
         throw new Error(
           `钱包 ${basePlan.quote.symbol} 余额不足，无法投入 ${basePlan.input.budget} ${basePlan.quote.symbol}`
         );
       }
-      const autoAllocation = addsLiquidity
-        ? await buildAutoAllocationQuote(provider, config, environment, basePlan, wallet.address)
-        : null;
+      const autoAllocation = recoveryAction
+        ? recoveredAutoAllocation(recoveryAction, basePlan, recoveredCaps)
+        : (addsLiquidity
+          ? await buildAutoAllocationQuote(provider, config, environment, basePlan, wallet.address)
+          : null);
       const quotedPlan = await buildPlan(
         provider,
         config,
@@ -1890,12 +2064,89 @@ export function createLiquidityRouter({
         wallet.address,
         true,
         autoAllocation?.amountCaps || null,
-        false,
+        Boolean(recoveryAction),
         lockedTicks
       );
-      assertExecutionPlanInvariant(quotedPlan, previewAuthorization);
+      assertExecutionPlanInvariant(quotedPlan, previewAuthorization, Boolean(recoveryAction));
       previewAuthorizations.delete(previewAuthorization.id);
       const startedBlockNumber = await provider.getBlockNumber();
+
+      if (recoveryAction) {
+        action = recoveryAction;
+        const previousCurrentTick = Number(action.plan.currentTick);
+        action.recoveryAttempts ||= [];
+        action.recoveryAttempts.push({
+          startedAt: new Date().toISOString(),
+          previousError: action.error || null
+        });
+        action.originalStartedBlockNumber ||= action.startedBlockNumber;
+        action.startedBlockNumber = startedBlockNumber;
+        action.stage = 'resuming';
+        action.error = null;
+        action.resolution = null;
+        action.currentTx = null;
+        action.plan = actionPlanSummary(quotedPlan);
+        delete action.failedAt;
+        delete action.resolvedAt;
+        delete action.positionReconciliation;
+        await persist(action);
+
+        if (Math.abs(quotedPlan.currentTick - previousCurrentTick)
+          > basePlan.input.tickSpacing * 2) {
+          throw new Error('恢复时池价已偏离原计划超过两个 Tick Spacing，已停止加仓');
+        }
+
+        action.stage = 'approving';
+        await persist(action);
+        await ensureApprovals(provider, wallet, config, quotedPlan, action, persist);
+
+        const refreshed = await buildPlan(
+          provider,
+          config,
+          req.body,
+          wallet.address,
+          true,
+          recoveredCaps,
+          true,
+          lockedTicks
+        );
+        assertExecutionPlanInvariant(refreshed, previewAuthorization, true);
+        if (!refreshed.wallet.sufficient0 || !refreshed.wallet.sufficient1) {
+          throw new Error('恢复授权后钱包余额不足，已停止发送加池交易');
+        }
+        if (!refreshed.approvalsReady || refreshed.estimatedGas === null) {
+          throw new Error('恢复授权后加池预检未完整通过，已停止发送加池交易');
+        }
+
+        action.stage = 'submitting';
+        action.plan = actionPlanSummary(refreshed);
+        await persist(action);
+        const receipt = await sendTransaction(provider, wallet, config, {
+          to: refreshed.positionManagerAddress,
+          data: refreshed.calldata,
+          value: 0n
+        }, async (hash) => {
+          action.currentTx = transactionEntry('mint_liquidity', null, hash);
+          action.liquidityTxHash = hash;
+          await persist(action);
+        });
+        action.transactions.push(transactionEntry('mint_liquidity', null, receipt.hash, receipt));
+        action.currentTx = null;
+        action.nftId = mintedTokenId(receipt, refreshed.positionManagerAddress, wallet.address);
+        if (!action.nftId) {
+          action.stage = 'needs_attention';
+          action.error = '恢复加池交易已确认成功，但未从回执识别 NFT ID；请先核对链上仓位';
+          action.completedAt = new Date().toISOString();
+          await persist(action);
+          return res.status(409).json({ error: action.error, action });
+        }
+        action.stage = 'completed';
+        action.completedAt = new Date().toISOString();
+        action.recoveredAt = action.completedAt;
+        await persist(action);
+        res.json(action);
+        return;
+      }
 
       action = {
         id: crypto.randomUUID(),

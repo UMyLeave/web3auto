@@ -8,13 +8,18 @@ import {
   encodeDecreasePosition,
   encodeIncreasePosition,
   managementActionBlocksExecution,
+  managementActionRecord,
   managementExecutionFingerprint,
+  managementFeeGrowthInside,
   managementOperationUsesAutoSwap,
+  managementPriceRange,
   managementPositionTicks,
   managementPrincipalAmounts,
   minimumRemovalAmounts,
   normalizeManagementInput,
-  removalLiquidityForOperation
+  removalLiquidityForOperation,
+  updateManagementActionHistory,
+  managementUncollectedFees
 } from '../liquidity-management-service.js';
 import { validateManagementSwapResponse } from '../liquidity-management-swap-service.js';
 import {
@@ -62,6 +67,85 @@ test('management principal calculation follows the active position range', () =>
   assert.ok(aboveRange.amount1 > 0n);
 });
 
+test('management price range derives ordered prices and grid position in both token directions', () => {
+  const direct = managementPriceRange({
+    tickLower: -600,
+    tickUpper: 600,
+    currentTick: 0,
+    tickSpacing: 60,
+    tradeDecimals: 18,
+    stableDecimals: 18,
+    tradeIsCurrency0: true,
+    activePrice: '1'
+  });
+  assert.equal(direct.gridCount, 20);
+  assert.equal(direct.currentGrid, 10);
+  assert.equal(direct.positionPercent, 50);
+  assert.ok(Number(direct.lowerPrice) < 1);
+  assert.ok(Number(direct.upperPrice) > 1);
+
+  const inverse = managementPriceRange({
+    tickLower: -600,
+    tickUpper: 600,
+    currentTick: -300,
+    tickSpacing: 60,
+    tradeDecimals: 18,
+    stableDecimals: 18,
+    tradeIsCurrency0: false,
+    activePrice: '1.0304529883759128'
+  });
+  assert.equal(inverse.gridCount, 20);
+  assert.equal(inverse.currentGrid, 15);
+  assert.equal(inverse.positionPercent, 75);
+  assert.ok(Number(inverse.lowerPrice) < Number(inverse.upperPrice));
+});
+
+test('management fee growth calculates in-range and outside-range accrued fees', () => {
+  const inside = managementFeeGrowthInside({
+    currentTick: 0,
+    tickLower: -60,
+    tickUpper: 60,
+    feeGrowthGlobal0X128: 1000n,
+    feeGrowthGlobal1X128: 2000n,
+    lowerFeeGrowthOutside0X128: 100n,
+    lowerFeeGrowthOutside1X128: 200n,
+    upperFeeGrowthOutside0X128: 300n,
+    upperFeeGrowthOutside1X128: 400n
+  });
+  assert.deepEqual(inside, {
+    feeGrowthInside0X128: 600n,
+    feeGrowthInside1X128: 1400n
+  });
+  assert.deepEqual(managementFeeGrowthInside({
+    currentTick: 100,
+    tickLower: -60,
+    tickUpper: 60,
+    feeGrowthGlobal0X128: 1000n,
+    feeGrowthGlobal1X128: 2000n,
+    lowerFeeGrowthOutside0X128: 100n,
+    lowerFeeGrowthOutside1X128: 200n,
+    upperFeeGrowthOutside0X128: 300n,
+    upperFeeGrowthOutside1X128: 400n
+  }), {
+    feeGrowthInside0X128: 200n,
+    feeGrowthInside1X128: 200n
+  });
+});
+
+test('management uncollected fees converts Q128 fee growth into token amounts', () => {
+  const q128 = 1n << 128n;
+  assert.deepEqual(managementUncollectedFees({
+    liquidity: 25n,
+    feeGrowthInside0X128: 3n * q128,
+    feeGrowthInside1X128: 5n * q128,
+    feeGrowthInside0LastX128: q128,
+    feeGrowthInside1LastX128: 2n * q128
+  }), {
+    amount0: 50n,
+    amount1: 75n
+  });
+});
+
 test('withdraw and emergency are fixed at 100 percent while reduce stays within 1-99 percent', () => {
   assert.equal(removalLiquidityForOperation(10_000n, 'withdraw'), 10_000n);
   assert.equal(removalLiquidityForOperation(10_000n, 'emergency'), 10_000n);
@@ -85,6 +169,37 @@ test('every non-terminal management action blocks other execution flows', () => 
   assert.equal(managementActionBlocksExecution({ stage: 'needs_attention' }), true);
   assert.equal(managementActionBlocksExecution({ stage: 'zap_out_swap_retry' }), true);
   assert.equal(managementActionBlocksExecution({ stage: 'cleaning_swap_approval' }), true);
+});
+
+test('management action history keeps only the compact latest result for each operation', () => {
+  const completed = {
+    id: 'action-1',
+    operation: 'emergency',
+    nftId: '42',
+    stage: 'completed',
+    startedAt: '2026-08-09T16:36:58.736Z',
+    completedAt: '2026-08-09T16:37:22.560Z',
+    finalLiquidity: '0',
+    transactions: [{ hash: '0x1234' }]
+  };
+  assert.deepEqual(managementActionRecord(completed), {
+    id: 'action-1',
+    operation: 'emergency',
+    nftId: '42',
+    stage: 'completed',
+    startedAt: '2026-08-09T16:36:58.736Z',
+    completedAt: '2026-08-09T16:37:22.560Z',
+    failedAt: null,
+    finalLiquidity: '0',
+    error: null
+  });
+  const updated = updateManagementActionHistory([
+    { id: 'action-1', stage: 'needs_attention' },
+    { id: 'action-0', operation: 'increase' }
+  ], completed);
+  assert.equal(updated.length, 2);
+  assert.deepEqual(updated[0], managementActionRecord(completed));
+  assert.equal(updated[1].id, 'action-0');
 });
 
 test('withdraw minimums apply the configured liquidity slippage to both currencies', () => {
@@ -206,9 +321,10 @@ test('management swap validation supports exact input in both zap directions', (
 });
 
 test('management UI is isolated in its own tab, script and stylesheet', async () => {
-  const [html, managementScript, legacyScript, themeScript, themeStyles, serverSource] = await Promise.all([
+  const [html, managementScript, managementStyles, legacyScript, themeScript, themeStyles, serverSource] = await Promise.all([
     fs.readFile(path.join(ROOT, 'public/liquidity.html'), 'utf8'),
     fs.readFile(path.join(ROOT, 'public/liquidity-management.js'), 'utf8'),
+    fs.readFile(path.join(ROOT, 'public/liquidity-management.css'), 'utf8'),
     fs.readFile(path.join(ROOT, 'public/liquidity.js'), 'utf8'),
     fs.readFile(path.join(ROOT, 'public/liquidity-theme.js'), 'utf8'),
     fs.readFile(path.join(ROOT, 'public/liquidity-theme.css'), 'utf8'),
@@ -225,7 +341,34 @@ test('management UI is isolated in its own tab, script and stylesheet', async ()
   assert.match(managementScript, /\/api\/liquidity-management/);
   assert.match(managementScript, /return \['increase', 'emergency'\]/);
   assert.match(managementScript, /\/retry-cleanup/);
+  assert.match(managementScript, /data-lm-open-operation="increase"/);
+  assert.match(managementScript, /data-lm-open-operation="reduce"/);
+  assert.match(managementScript, /data-lm-open-operation="withdraw"/);
+  assert.match(managementScript, /data-lm-open-operation="emergency"/);
+  assert.match(managementScript, /data-lm-open-records/);
+  assert.match(managementScript, /操作行为/);
+  assert.match(managementScript, /操作结果/);
+  assert.match(managementScript, /操作时间/);
+  assert.match(managementScript, /isEmergencyRetired/);
+  assert.match(managementScript, /confirmAction/);
+  assert.doesNotMatch(managementScript, /window\.confirm/);
+  assert.doesNotMatch(managementScript, /执行状态/);
+  assert.match(managementScript, /策略仓位/);
+  assert.match(managementScript, /价格区间/);
+  assert.match(managementScript, /range\.currentGrid/);
+  assert.match(managementScript, /position\.priceRange \|\| fallbackPriceRange\(position\)/);
+  assert.match(managementScript, /范围 Tick/);
+  assert.doesNotMatch(managementScript, /lm-operation-tabs/);
   assert.doesNotMatch(managementScript, /减仓仅兑换/);
+  assert.match(managementStyles, /\.lm-strategy-position/);
+  assert.match(managementStyles, /\.lm-position-actions/);
+  assert.match(managementStyles, /\.lm-price-track/);
+  assert.match(managementStyles, /\.lm-range-status/);
+  assert.match(managementStyles, /\.lm-modal-card/);
+  assert.match(managementStyles, /\.lm-record-item/);
+  assert.match(managementStyles, /button\[data-tooltip\]::after/);
+  assert.match(managementStyles, /width: min\(820px, 100%\)/);
+  assert.doesNotMatch(managementStyles, /\.lm-operation-tab/);
   assert.match(themeScript, /scheduledLiquidityTheme/);
   assert.match(themeStyles, /data-theme="light"/);
   assert.doesNotMatch(legacyScript, /liquidity-management/);

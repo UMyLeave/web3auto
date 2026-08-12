@@ -128,6 +128,7 @@ app.use('/api/liquidity', liquidityRouter);
 liquidityManagementRouter = createLiquidityManagementRouter({
   configPath: LIQUIDITY_CONFIG_PATH,
   actionPath: LIQUIDITY_MANAGEMENT_ACTION_PATH,
+  liquidityActionPath: LIQUIDITY_ACTION_PATH,
   executionConflict: () => {
     if (state.running || state.inFlight || state.arming) {
       return '仓位监控或撤退/兑换流程正在运行，请先停止并等待链上操作结束';

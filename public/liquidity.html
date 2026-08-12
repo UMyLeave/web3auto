@@ -52,16 +52,20 @@
       </div>
     </section>
 
-    <nav class="liquidity-workspace-tabs" aria-label="流动性功能">
-      <button class="liquidity-workspace-tab active" type="button" data-liquidity-tab="create"
-        aria-controls="liquidityCreatePanel" aria-selected="true">
-        创建新池
-      </button>
-      <button class="liquidity-workspace-tab" type="button" data-liquidity-tab="manage"
-        aria-controls="liquidityManagePanel" aria-selected="false">
-        管理已有仓位
-      </button>
-    </nav>
+    <section id="liquidityManagePanel" data-liquidity-panel="manage" data-liquidity-tab="manage"></section>
+
+    <div id="liquidityCreateModal" class="lm-modal" data-liquidity-tab="create" role="dialog" aria-modal="true"
+      aria-labelledby="liquidityCreateModalTitle" hidden>
+      <div class="lm-modal-backdrop" data-lm-close-create></div>
+      <section class="lm-create-modal-card">
+        <header class="lm-modal-heading">
+          <div>
+            <span>流动性初始化</span>
+            <strong id="liquidityCreateModalTitle">初始化流动性</strong>
+          </div>
+          <button id="liquidityCreateModalClose" type="button" aria-label="关闭初始化窗口">×</button>
+        </header>
+        <div class="lm-create-modal-body">
 
     <div id="liquidityCreatePanel" class="liquidity-layout" data-liquidity-panel="create">
       <form id="liquidityForm" class="liquidity-card liquidity-form-card">
@@ -248,7 +252,9 @@
       </aside>
     </div>
 
-    <section id="liquidityManagePanel" data-liquidity-panel="manage" hidden></section>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script type="module" src="/modules/sidebar.js"></script>
